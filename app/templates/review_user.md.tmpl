@@ -1,0 +1,78 @@
+# Pull Request Review Context
+
+## Repository
+- Name: {{ .Repository.Name }}
+- Root: {{ .Repository.Root }}
+- Remote: {{ emptyFallback .Repository.RemoteURL "unknown" }}
+- GitHub repository: {{ emptyFallback .CI.Repository "unknown" }}
+
+## Comparison
+- Base ref: {{ .Comparison.BaseRef }}
+- Head ref: {{ .Comparison.HeadRef }}
+- Merge base: {{ .Comparison.MergeBase }}
+- GitHub SHA: {{ emptyFallback .CI.SHA "unknown" }}
+{{ if .PullRequest }}
+
+## Pull Request Metadata
+- Number: {{ .PullRequest.Number }}
+- Title: {{ emptyFallback .PullRequest.Title "unknown" }}
+- Author: {{ emptyFallback .PullRequest.Author "unknown" }}
+- URL: {{ emptyFallback .PullRequest.URL "unknown" }}
+- Base: {{ emptyFallback .PullRequest.BaseRef "unknown" }}
+- Head: {{ emptyFallback .PullRequest.HeadRef "unknown" }}
+
+### Pull Request Body
+{{ emptyFallback .PullRequest.Body "No PR body provided." }}
+{{ end }}
+
+## Commits
+{{ if .Commits }}{{ range .Commits }}- {{ shortHash .Hash }} {{ .Subject }} by {{ .Author }}
+{{ end }}{{ else }}- No commits found.
+{{ end }}
+
+## Changed Files
+{{ if .Files }}{{ range .Files }}- {{ .Status }} {{ .Path }} (+{{ .Additions }}/-{{ .Deletions }})
+{{ end }}{{ else }}- No changed files found.
+{{ end }}
+
+## Diff
+```diff
+{{ .Diff }}
+```
+
+## Requested Review Document Shape
+Return Markdown that reads like a guided walkthrough, not a rigid checklist.
+Write as if you were sitting next to another engineer, walking them through the code and helping them understand the change.
+Keep it straightforward and practical.
+Tell a story: guide the reader through the code, the flow, the important choices, and why those choices fit this problem.
+Show, do not tell: use short code snippets to demonstrate the thing being explained instead of writing long blocks of text that merely name files and functions.
+Do not repeat what the reader can already see in the diff. Explain purpose, consequence, and review significance.
+
+Use these sections when evidence supports them:
+- What changed and why it matters
+- Walkthrough of the flow
+- Choices that look intentional
+- Side effects and risks
+- Snippets worth looking at
+- Review comments
+- Verification guidance
+- Open questions
+
+Snippet guidance:
+- Use short fenced code snippets from the diff to show the exact thing being explained.
+- Introduce each snippet with why it matters.
+- Do not paste large blocks that the reviewer can read directly in the diff.
+- Prefer one well-chosen snippet with a clear explanation over a file-by-file inventory.
+
+Mermaid guidance:
+- Use Mermaid only when it makes the flow easier to understand.
+- Prefer simple `flowchart TD` diagrams.
+- Quote labels that contain punctuation or spaces, like `A["Collect context"]`.
+- Avoid parentheses, braces, angle brackets, raw HTML, Markdown links, or code syntax inside labels.
+
+For review comments, use this structure:
+```text
+File: <path>
+Concern: <specific concern>
+Suggested comment: <paste-ready review comment>
+```

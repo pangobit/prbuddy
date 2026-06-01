@@ -152,10 +152,16 @@ func TestBuildPromptRequestsRichMarkdownReviewDocument(t *testing.T) {
 	prompt := BuildPrompt(review.Context{})
 	required := []string{
 		"Return Markdown only.",
+		"sitting next to another engineer",
+		"walking them through the code",
+		"Show, do not tell.",
+		"Tell the story of the code",
+		"Do not repeat what the reader can already see in the diff",
 		"fenced code snippets",
 		"Mermaid diagrams",
-		"Side Effects and Risks",
-		"Review Comments",
+		"flowchart TD",
+		"Side effects and risks",
+		"Review comments",
 		"Suggested comment",
 	}
 

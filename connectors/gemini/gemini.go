@@ -11,7 +11,7 @@ import (
 	"github.com/pangobit/prbuddy/internal/llm"
 )
 
-const defaultModel = "gemini-2.5-flash"
+const defaultModel = "gemini-3.5-flash"
 const proxyPlaceholderKey = "prbuddy-proxy"
 
 // Client generates review markdown with Gemini.

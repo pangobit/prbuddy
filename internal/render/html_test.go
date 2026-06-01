@@ -101,7 +101,8 @@ func TestHTMLRendererSupportsTablesAndMermaidBlocks(t *testing.T) {
 		"<th>Risk</th>",
 		"<td>Side effect</td>",
 		"language-mermaid",
-		"mermaid.initialize",
+		"mermaid.run",
+		"securityLevel: \"strict\"",
 	}
 
 	for _, want := range required {

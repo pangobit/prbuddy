@@ -1,0 +1,2507 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PR Buddy Review Guide</title>
+  <style>
+    body { color: #1f2937; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
+    h1, h2 { color: #111827; line-height: 1.2; }
+    code, pre { background: #f3f4f6; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { padding: 0.1rem 0.3rem; }
+    pre { overflow-x: auto; padding: 1rem; }
+    pre.mermaid { background: #ffffff; border: 1px solid #e5e7eb; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 0.5rem; text-align: left; vertical-align: top; }
+    .muted { color: #6b7280; }
+    .review { margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>PR Buddy Review Guide</h1>
+    <section>
+      <h2>Repository</h2>
+      <p><strong>prbuddy</strong></p>
+      <p class="muted">/Users/raybarrera/projects/prbuddy</p>
+      <p><code>git@github.com:pangobit/prbuddy.git</code></p>
+    </section>
+    <section>
+      <h2>Comparison</h2>
+      <p><code>master</code> to <code>HEAD</code></p>
+      <p class="muted">Merge base: <code>7a24932e4c018538d40c81fcf72370012b8a733c</code></p>
+    </section>
+    
+    <section class="review">
+      <h3>What changed and why it matters</h3>
+<p>We are introducing the foundations of <strong>PR Buddy</strong>, a CLI tool designed to run locally or inside a CI environment (like GitHub Actions). It collects local Git workspace history, reads metadata from local GitHub Action events, asks an LLM (Gemini or Grok) to write a detailed review guide, and outputs a self-contained, sanitized HTML document to <code>stdout</code>.</p>
+<p>Instead of making external API requests to fetch diffs or PR metadata—which introduces latency, rate-limiting friction, and token-scope management—PR Buddy leverages the local environment. It reads the local checkout using <code>git</code> directly and parses local JSON event files.</p>
+<hr>
+<h3>Walkthrough of the flow</h3>
+<p>Here is how the components interact to build and render the PR review guide:</p>
+<pre><code class="language-mermaid">flowchart TD
+    A[&#34;CLI Entry (api/cli)&#34;] --&gt; B[&#34;Usecase (app.GenerateReview)&#34;]
+    B --&gt; C[&#34;GitCollector (internal/review)&#34;]
+    B --&gt; D[&#34;Event Parser (internal/review)&#34;]
+    C --&gt; E[&#34;Review Context Struct&#34;]
+    D --&gt; E
+    B --&gt; F[&#34;Prompt Builder (app/prompt)&#34;]
+    E --&gt; F
+    B --&gt; G[&#34;LLM Factory (connectors)&#34;]
+    F --&gt; H[&#34;LLM Client (Gemini or Grok)&#34;]
+    G --&gt; H
+    H --&gt; I[&#34;Markdown Output&#34;]
+    I --&gt; J[&#34;HTML Renderer (internal/render)&#34;]
+    E --&gt; J
+    J --&gt; K[&#34;Sanitized HTML Output (stdout)&#34;]
+</code></pre>
+<ol>
+<li><strong>CLI Trigger:</strong> The <code>render</code> command gathers configuration from flags and environment variables.</li>
+<li><strong>Context Collection:</strong> The <code>GitCollector</code> executes local Git commands to extract the commit log, file list, line stats, and raw diff. Simultaneously, <code>collectEventMetadata</code> reads the GitHub Action event payload file to parse PR details.</li>
+<li><strong>Prompt Compilation:</strong> The structured context is packed into a two-part prompt (System instructions and User metadata).</li>
+<li><strong>LLM Dispatch:</strong> The appropriate adapter (Gemini or Grok) is selected via a factory, calls the respective API, and receives a rich Markdown review.</li>
+<li><strong>HTML Generation:</strong> The Markdown is parsed via <code>goldmark</code>, sanitized using <code>bluemonday</code> to prevent XSS, and embedded alongside the raw git metadata inside an HTML template.</li>
+</ol>
+<hr>
+<h3>Choices that look intentional</h3>
+<h4>No GitHub API Dependencies</h4>
+<p>By reading local workspace files and relying on the runner environment, the tool avoids setting up GitHub clients or requiring GitHub personal access tokens:</p>
+<pre><code class="language-go">runE: func(cmd *cobra.Command, _ []string) error {
+    if err := validateRenderOptions(opts); err != nil {
+        return err
+    }
+    // Context is collected entirely from the filesystem
+    if err := generator.GenerateReview(cmd.Context(), out, opts); err != nil { ... }
+}
+</code></pre>
+<h4>Safe Custom Proxying</h4>
+<p>For users in highly secure enterprise environments, the Gemini adapter allows empty API keys when a custom provider URL is configured. This lets internal authenticated gateways own the token injection instead of forcing developers to pass credentials to their local environments:</p>
+<pre><code class="language-go">func NewClient(ctx context.Context, apiKey string, model string, providerURL string) (*Client, error) {
+	if providerURL != &#34;&#34; &amp;&amp; apiKey == &#34;&#34; {
+		apiKey = proxyPlaceholderKey
+	}
+    ...
+</code></pre>
+<h4>Strict HTML Sanitization</h4>
+<p>Since the LLM-generated output is rendered directly into HTML, we prevent malicious Markdown patterns by enforcing a <code>bluemonday</code> policy while allowing specific syntax choices like tables and code blocks:</p>
+<pre><code class="language-go">func markdownPolicy() *bluemonday.Policy {
+	policy := bluemonday.UGCPolicy()
+	policy.AllowAttrs(&#34;class&#34;).Matching(bluemonday.SpaceSeparatedTokens).OnElements(&#34;code&#34;)
+	policy.AllowElements(&#34;table&#34;, &#34;thead&#34;, &#34;tbody&#34;, &#34;tr&#34;, &#34;th&#34;, &#34;td&#34;)
+	policy.AllowAttrs(&#34;align&#34;).OnElements(&#34;th&#34;, &#34;td&#34;)
+	return policy
+}
+</code></pre>
+<hr>
+<h3>Snippets worth looking at</h3>
+<h4>Running Git as a Process</h4>
+<p>The collection pipeline calls the Git binary directly via the standard library&#39;s <code>exec.CommandContext</code>. Spawning external processes can be flaky, but the tool manages this cleanly by capturing stderr messages and bubbling them up into the Go error path:</p>
+<pre><code class="language-go">func gitRawOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, &#34;git&#34;, args...)
+	cmd.Dir = dir
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &amp;stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == &#34;&#34; {
+			return &#34;&#34;, err
+		}
+		return &#34;&#34;, fmt.Errorf(&#34;%w: %s&#34;, err, message)
+	}
+	return string(output), nil
+}
+</code></pre>
+<h4>Parsing File Changes with Binary Protection</h4>
+<p>When computing line stats (<code>additions</code> and <code>deletions</code>), binary file modifications (like images) show up in git logs as hyphen characters (<code>-</code>). The parser handles this explicitly to avoid type-conversion panics:</p>
+<pre><code class="language-go">func parseGitLineCount(value string) (int, error) {
+	if value == &#34;-&#34; {
+		return 0, nil
+	}
+
+	lineCount, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+
+	return lineCount, nil
+}
+</code></pre>
+<hr>
+<h3>Side effects and risks</h3>
+<ul>
+<li><strong>Workspace State Dependency:</strong> Because PR Buddy relies on executing <code>git</code> binaries, it assumes that the running user has <code>git</code> installed on their PATH, and that the execution directory is a valid git workspace. If used in lightweight, containerized CI runners, make sure Git is pre-installed.</li>
+<li><strong>Payload Exposure to LLM:</strong> The prompt sends the raw git diff and git log straight to the LLM. If your codebase contains sensitive inline keys or proprietary code, those values will be transmitted to the configured API provider.</li>
+</ul>
+<hr>
+<h3>Review comments</h3>
+<p>Here are a few technical improvements we should address before merging this in.</p>
+<pre><code class="language-text">File: connectors/gemini/gemini.go
+Concern: Combining system instructions into a single prompt string bypasses Gemini&#39;s native SystemInstruction configuration block.
+Suggested comment: Currently, `joinPrompt` merges the system instructions and user contents with a newline separator:
+
+```go
+func joinPrompt(prompt llm.Prompt) string {
+	return prompt.System + &#34;\n\n&#34; + prompt.User
+}
+</code></pre>
+<p>While this works, it makes the model more vulnerable to prompt injection and degrades instruction adherence compared to native configuration. We should pass <code>prompt.System</code> into the <code>genai.GenerateContentConfig.SystemInstruction</code> field during the generation step instead of concatenating them.</p>
+<pre><code>
+```text
+File: internal/review/event.go
+Concern: A malformed JSON event payload file will completely abort the context gathering workflow.
+Suggested comment: In `collectEventMetadata`, any error reading or parsing the file at `EventPath` will block the CLI execution:
+
+```go
+metadata, err := parseGitHubEvent(data)
+if err != nil {
+	return nil, fmt.Errorf(&#34;parse event payload: %w&#34;, err)
+}
+</code></pre>
+<p>In GitHub Actions, other automated events (or manual triggers) might provide payloads that do not strictly match a <code>pull_request</code> schema but are still valid JSON files. We should consider making event-payload failures a &#34;soft warning&#34; (printed to stderr) rather than an execution blocker, allowing the program to gracefully fall back to pure Git context.</p>
+<pre><code>
+---
+
+### Verification guidance
+
+#### Local Verification
+You can run the tests across the codebase with:
+```bash
+go test -v ./...
+</code></pre>
+<p>To verify the CLI works end-to-end against this local checkout using a live LLM, run the following:</p>
+<pre><code class="language-bash"># For Gemini
+GEMINI_API_KEY=&#34;your-key-here&#34; go run ./cmd/prbuddy render --provider gemini --base master --head HEAD &gt; review.html
+
+# For Grok
+XAI_API_KEY=&#34;your-key-here&#34; go run ./cmd/prbuddy render --provider grok --base master --head HEAD &gt; review.html
+</code></pre>
+<p>Open <code>review.html</code> in your browser to verify that the format is sanitized and CSS-styled correctly.</p>
+
+    </section>
+    <section>
+      <h2>Raw Context</h2>
+      <p class="muted">1 commits, 21 changed files.</p>
+      <details><summary>Diff</summary><pre><code>diff --git a/README.md b/README.md
+index e69de29..5e05668 100644
+--- a/README.md
+&#43;&#43;&#43; b/README.md
+@@ -0,0 &#43;1,94 @@
+&#43;# PR Buddy
+&#43;
+&#43;PR Buddy generates a single HTML review guide for a pull request comparison
+&#43;using local git context, CI metadata, and an LLM provider. The CLI is designed
+&#43;to run locally or inside GitHub Actions, and it writes the HTML document to
+&#43;stdout so another command or workflow step can decide what to do with it.
+&#43;
+&#43;## Install
+&#43;
+&#43;```bash
+&#43;go install github.com/pangobit/prbuddy/cmd/prbuddy@v0.1.0
+&#43;```
+&#43;
+&#43;During local development, run the command directly from the repository:
+&#43;
+&#43;```bash
+&#43;GEMINI_API_KEY=... go run ./cmd/prbuddy render --provider gemini --base origin/main --head HEAD
+&#43;```
+&#43;
+&#43;## Usage
+&#43;
+&#43;```bash
+&#43;prbuddy render --provider gemini --base origin/main --head HEAD &gt; pr-review.html
+&#43;prbuddy render --provider grok --base origin/main --head HEAD &gt; pr-review.html
+&#43;```
+&#43;
+&#43;To test Gemini through a trusted local proxy, override the provider URL. This
+&#43;path allows an empty Gemini key because the proxy owns authentication:
+&#43;
+&#43;```bash
+&#43;prbuddy render --provider gemini --provider-url https://ai --base origin/main --head HEAD &gt; pr-review.html
+&#43;```
+&#43;
+&#43;The command writes:
+&#43;
+&#43;- stdout: one complete HTML document
+&#43;- stderr: diagnostics and errors
+&#43;
+&#43;PR Buddy does not save, serve, open, or publish the HTML file. Redirect stdout
+&#43;when a file is useful.
+&#43;
+&#43;Provider credentials are read from environment variables:
+&#43;
+&#43;- `--provider gemini` requires `GEMINI_API_KEY`
+&#43;- `--provider grok` requires `XAI_API_KEY`
+&#43;
+&#43;`--provider gemini --provider-url &lt;url&gt;` allows `GEMINI_API_KEY` to be empty for
+&#43;trusted proxy workflows.
+&#43;
+&#43;Provider models can be overridden with `--model`, `PRBUDDY_MODEL`,
+&#43;`PRBUDDY_GEMINI_MODEL`, or `PRBUDDY_GROK_MODEL`.
+&#43;
+&#43;The provider returns Markdown. PR Buddy converts that Markdown into the final
+&#43;HTML document, supports tables and Mermaid code blocks, and sanitizes rendered
+&#43;Markdown before writing the document.
+&#43;
+&#43;When running in GitHub Actions, PR Buddy reads available workflow metadata from
+&#43;the default `GITHUB_*` environment variables and `$GITHUB_EVENT_PATH`. It does
+&#43;not call the GitHub API, use `gh`, or fetch `diff_url`.
+&#43;
+&#43;## GitHub Actions
+&#43;
+&#43;```yaml
+&#43;steps:
+&#43;  - uses: actions/checkout@v4
+&#43;    with:
+&#43;      fetch-depth: 0
+&#43;
+&#43;  - uses: actions/setup-go@v5
+&#43;    with:
+&#43;      go-version: &#34;1.25.x&#34;
+&#43;
+&#43;  - run: go install github.com/pangobit/prbuddy/cmd/prbuddy@v0.1.0
+&#43;
+&#43;  - name: Render PR review HTML
+&#43;    id: prbuddy
+&#43;    env:
+&#43;      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+&#43;    run: |
+&#43;      prbuddy render --provider gemini &gt; pr-review.html
+&#43;      echo &#34;html_path=pr-review.html&#34; &gt;&gt; &#34;$GITHUB_OUTPUT&#34;
+&#43;
+&#43;  - name: Use rendered HTML
+&#43;    run: some-other-tool &#34;${{ steps.prbuddy.outputs.html_path }}&#34;
+&#43;```
+&#43;
+&#43;For handoff to another job, upload the generated file as an artifact:
+&#43;
+&#43;```yaml
+&#43;- uses: actions/upload-artifact@v4
+&#43;  with:
+&#43;    name: pr-review-html
+&#43;    path: pr-review.html
+&#43;```
+diff --git a/api/cli/root.go b/api/cli/root.go
+new file mode 100644
+index 0000000..07bebb8
+--- /dev/null
+&#43;&#43;&#43; b/api/cli/root.go
+@@ -0,0 &#43;1,72 @@
+&#43;// Package cli wires PR Buddy&#39;s command-line interface to application behavior.
+&#43;package cli
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;errors&#34;
+&#43;	&#34;fmt&#34;
+&#43;	&#34;io&#34;
+&#43;
+&#43;	&#34;github.com/spf13/cobra&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/app&#34;
+&#43;)
+&#43;
+&#43;// Generator runs the PR review generation use case.
+&#43;type Generator interface {
+&#43;	GenerateReview(context.Context, io.Writer, app.GenerateReviewOptions) error
+&#43;}
+&#43;
+&#43;// NewRootCommand creates the PR Buddy root command.
+&#43;func NewRootCommand(out io.Writer, errOut io.Writer, generator Generator) *cobra.Command {
+&#43;	root := &amp;cobra.Command{
+&#43;		Use:           &#34;prbuddy&#34;,
+&#43;		Short:         &#34;Generate PR review artifacts for humans and LLM workflows&#34;,
+&#43;		SilenceUsage:  true,
+&#43;		SilenceErrors: true,
+&#43;	}
+&#43;
+&#43;	root.SetOut(out)
+&#43;	root.SetErr(errOut)
+&#43;	root.AddCommand(newRenderCommand(out, generator))
+&#43;
+&#43;	return root
+&#43;}
+&#43;
+&#43;func newRenderCommand(out io.Writer, generator Generator) *cobra.Command {
+&#43;	var opts app.GenerateReviewOptions
+&#43;
+&#43;	cmd := &amp;cobra.Command{
+&#43;		Use:   &#34;render&#34;,
+&#43;		Short: &#34;Generate and render a PR review guide as HTML&#34;,
+&#43;		RunE: func(cmd *cobra.Command, _ []string) error {
+&#43;			if err := validateRenderOptions(opts); err != nil {
+&#43;				return err
+&#43;			}
+&#43;
+&#43;			if err := generator.GenerateReview(cmd.Context(), out, opts); err != nil {
+&#43;				return fmt.Errorf(&#34;generate review: %w&#34;, err)
+&#43;			}
+&#43;
+&#43;			return nil
+&#43;		},
+&#43;	}
+&#43;
+&#43;	cmd.Flags().StringVar(&amp;opts.RepositoryPath, &#34;repo&#34;, &#34;.&#34;, &#34;path to the git repository&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.BaseRef, &#34;base&#34;, &#34;&#34;, &#34;base git ref for the review&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.HeadRef, &#34;head&#34;, &#34;&#34;, &#34;head git ref for the review&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.EventPath, &#34;event-path&#34;, &#34;&#34;, &#34;path to a GitHub Actions event payload&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.Provider, &#34;provider&#34;, &#34;&#34;, &#34;LLM provider to use: gemini or grok&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.Model, &#34;model&#34;, &#34;&#34;, &#34;provider model override&#34;)
+&#43;	cmd.Flags().StringVar(&amp;opts.ProviderURL, &#34;provider-url&#34;, &#34;&#34;, &#34;provider endpoint override&#34;)
+&#43;
+&#43;	return cmd
+&#43;}
+&#43;
+&#43;func validateRenderOptions(opts app.GenerateReviewOptions) error {
+&#43;	if opts.RepositoryPath == &#34;&#34; {
+&#43;		return errors.New(&#34;repo must not be empty&#34;)
+&#43;	}
+&#43;
+&#43;	return nil
+&#43;}
+diff --git a/api/cli/root_test.go b/api/cli/root_test.go
+new file mode 100644
+index 0000000..5200b4d
+--- /dev/null
+&#43;&#43;&#43; b/api/cli/root_test.go
+@@ -0,0 &#43;1,90 @@
+&#43;package cli
+&#43;
+&#43;import (
+&#43;	&#34;bytes&#34;
+&#43;	&#34;context&#34;
+&#43;	&#34;io&#34;
+&#43;	&#34;strings&#34;
+&#43;	&#34;testing&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/app&#34;
+&#43;)
+&#43;
+&#43;func TestRenderCommandRunsGenerator(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	var stdout bytes.Buffer
+&#43;	var stderr bytes.Buffer
+&#43;	generator := &amp;fakeGenerator{}
+&#43;	cmd := NewRootCommand(&amp;stdout, &amp;stderr, generator)
+&#43;	cmd.SetArgs([]string{
+&#43;		&#34;render&#34;,
+&#43;		&#34;--repo&#34;, &#34;.&#34;,
+&#43;		&#34;--base&#34;, &#34;main&#34;,
+&#43;		&#34;--head&#34;, &#34;feature&#34;,
+&#43;		&#34;--event-path&#34;, &#34;event.json&#34;,
+&#43;		&#34;--provider&#34;, &#34;gemini&#34;,
+&#43;		&#34;--provider-url&#34;, &#34;https://ai&#34;,
+&#43;		&#34;--model&#34;, &#34;gemini-test&#34;,
+&#43;	})
+&#43;
+&#43;	if err := cmd.Execute(); err != nil {
+&#43;		t.Fatalf(&#34;execute command: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if got := stdout.String(); got != &#34;&lt;!doctype html&gt;&lt;html&gt;&lt;/html&gt;&#34; {
+&#43;		t.Fatalf(&#34;stdout = %q&#34;, got)
+&#43;	}
+&#43;
+&#43;	if got := stderr.String(); got != &#34;&#34; {
+&#43;		t.Fatalf(&#34;stderr = %q&#34;, got)
+&#43;	}
+&#43;
+&#43;	if generator.got.BaseRef != &#34;main&#34; {
+&#43;		t.Fatalf(&#34;base ref = %q&#34;, generator.got.BaseRef)
+&#43;	}
+&#43;
+&#43;	if generator.got.Provider != &#34;gemini&#34; {
+&#43;		t.Fatalf(&#34;provider = %q&#34;, generator.got.Provider)
+&#43;	}
+&#43;
+&#43;	if generator.got.Model != &#34;gemini-test&#34; {
+&#43;		t.Fatalf(&#34;model = %q&#34;, generator.got.Model)
+&#43;	}
+&#43;
+&#43;	if generator.got.ProviderURL != &#34;https://ai&#34; {
+&#43;		t.Fatalf(&#34;provider url = %q&#34;, generator.got.ProviderURL)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestRenderCommandRejectsEmptyRepo(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	var stdout bytes.Buffer
+&#43;	var stderr bytes.Buffer
+&#43;	cmd := NewRootCommand(&amp;stdout, &amp;stderr, &amp;fakeGenerator{})
+&#43;	cmd.SetArgs([]string{&#34;render&#34;, &#34;--repo&#34;, &#34;&#34;})
+&#43;
+&#43;	err := cmd.Execute()
+&#43;	if err == nil {
+&#43;		t.Fatal(&#34;expected error&#34;)
+&#43;	}
+&#43;
+&#43;	if !strings.Contains(err.Error(), &#34;repo must not be empty&#34;) {
+&#43;		t.Fatalf(&#34;error = %q&#34;, err)
+&#43;	}
+&#43;
+&#43;	if got := stdout.String(); got != &#34;&#34; {
+&#43;		t.Fatalf(&#34;stdout = %q&#34;, got)
+&#43;	}
+&#43;}
+&#43;
+&#43;type fakeGenerator struct {
+&#43;	got app.GenerateReviewOptions
+&#43;}
+&#43;
+&#43;func (g *fakeGenerator) GenerateReview(_ context.Context, out io.Writer, opts app.GenerateReviewOptions) error {
+&#43;	g.got = opts
+&#43;	_, err := io.WriteString(out, &#34;&lt;!doctype html&gt;&lt;html&gt;&lt;/html&gt;&#34;)
+&#43;	return err
+&#43;}
+diff --git a/app/environment.go b/app/environment.go
+new file mode 100644
+index 0000000..44dd1c9
+--- /dev/null
+&#43;&#43;&#43; b/app/environment.go
+@@ -0,0 &#43;1,31 @@
+&#43;package app
+&#43;
+&#43;import &#34;strings&#34;
+&#43;
+&#43;// Environment provides read-only access to process environment values.
+&#43;type Environment interface {
+&#43;	LookupEnv(string) (string, bool)
+&#43;}
+&#43;
+&#43;// MapEnvironment is an immutable environment snapshot.
+&#43;type MapEnvironment map[string]string
+&#43;
+&#43;// NewEnvironment creates an environment snapshot from os.Environ-style values.
+&#43;func NewEnvironment(values []string) MapEnvironment {
+&#43;	env := make(MapEnvironment, len(values))
+&#43;	for _, value := range values {
+&#43;		name, val, ok := strings.Cut(value, &#34;=&#34;)
+&#43;		if !ok {
+&#43;			continue
+&#43;		}
+&#43;		env[name] = val
+&#43;	}
+&#43;
+&#43;	return env
+&#43;}
+&#43;
+&#43;// LookupEnv returns the value for name.
+&#43;func (e MapEnvironment) LookupEnv(name string) (string, bool) {
+&#43;	value, ok := e[name]
+&#43;	return value, ok
+&#43;}
+diff --git a/app/generate.go b/app/generate.go
+new file mode 100644
+index 0000000..ae7427e
+--- /dev/null
+&#43;&#43;&#43; b/app/generate.go
+@@ -0,0 &#43;1,271 @@
+&#43;// Package app coordinates PR Buddy use cases.
+&#43;package app
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;errors&#34;
+&#43;	&#34;fmt&#34;
+&#43;	&#34;io&#34;
+&#43;	&#34;strings&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/llm&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;// Provider identifies the selected LLM provider.
+&#43;type Provider string
+&#43;
+&#43;const (
+&#43;	// ProviderGemini selects the Gemini adapter.
+&#43;	ProviderGemini Provider = &#34;gemini&#34;
+&#43;	// ProviderGrok selects the Grok adapter.
+&#43;	ProviderGrok Provider = &#34;grok&#34;
+&#43;)
+&#43;
+&#43;// GenerateReviewOptions controls one review generation run.
+&#43;type GenerateReviewOptions struct {
+&#43;	// RepositoryPath is the filesystem path to the git repository.
+&#43;	RepositoryPath string
+&#43;	// BaseRef is the optional base git ref for the review.
+&#43;	BaseRef string
+&#43;	// HeadRef is the optional head git ref for the review.
+&#43;	HeadRef string
+&#43;	// EventPath is the optional path to a GitHub Actions event payload.
+&#43;	EventPath string
+&#43;	// Provider is the required LLM provider name.
+&#43;	Provider string
+&#43;	// Model is an optional provider model override.
+&#43;	Model string
+&#43;	// ProviderURL is an optional provider endpoint override.
+&#43;	ProviderURL string
+&#43;}
+&#43;
+&#43;// ReviewCollector builds review context for a render request.
+&#43;type ReviewCollector interface {
+&#43;	Collect(context.Context, review.CollectOptions) (review.Context, error)
+&#43;}
+&#43;
+&#43;// LLMClient generates review content from a prompt.
+&#43;type LLMClient interface {
+&#43;	GenerateMarkdown(context.Context, llm.Prompt) (string, error)
+&#43;}
+&#43;
+&#43;// LLMFactory creates a provider client for a generation run.
+&#43;type LLMFactory interface {
+&#43;	Client(context.Context, ProviderConfig) (LLMClient, error)
+&#43;}
+&#43;
+&#43;// LLMFactoryFunc adapts a function into an LLM factory.
+&#43;type LLMFactoryFunc func(context.Context, ProviderConfig) (LLMClient, error)
+&#43;
+&#43;// Client creates a provider client for a generation run.
+&#43;func (f LLMFactoryFunc) Client(ctx context.Context, config ProviderConfig) (LLMClient, error) {
+&#43;	return f(ctx, config)
+&#43;}
+&#43;
+&#43;// ProviderConfig contains provider adapter configuration.
+&#43;type ProviderConfig struct {
+&#43;	// Provider is the selected LLM provider.
+&#43;	Provider Provider
+&#43;	// APIKey is the required provider credential.
+&#43;	APIKey string
+&#43;	// Model is the optional provider model override.
+&#43;	Model string
+&#43;	// ProviderURL is the optional provider endpoint override.
+&#43;	ProviderURL string
+&#43;}
+&#43;
+&#43;// DocumentRenderer writes a complete HTML review document.
+&#43;type DocumentRenderer interface {
+&#43;	Render(context.Context, io.Writer, review.Context, string) error
+&#43;}
+&#43;
+&#43;// GenerateReviewUseCase coordinates context collection, LLM generation, and rendering.
+&#43;type GenerateReviewUseCase struct {
+&#43;	collector ReviewCollector
+&#43;	factory   LLMFactory
+&#43;	renderer  DocumentRenderer
+&#43;	env       Environment
+&#43;}
+&#43;
+&#43;// NewGenerateReviewUseCase creates the review generation use case.
+&#43;func NewGenerateReviewUseCase(collector ReviewCollector, factory LLMFactory, renderer DocumentRenderer, env Environment) *GenerateReviewUseCase {
+&#43;	return &amp;GenerateReviewUseCase{
+&#43;		collector: collector,
+&#43;		factory:   factory,
+&#43;		renderer:  renderer,
+&#43;		env:       env,
+&#43;	}
+&#43;}
+&#43;
+&#43;// GenerateReview writes one complete HTML review document to out.
+&#43;func (u *GenerateReviewUseCase) GenerateReview(ctx context.Context, out io.Writer, opts GenerateReviewOptions) error {
+&#43;	resolved, err := u.resolveOptions(opts)
+&#43;	if err != nil {
+&#43;		return err
+&#43;	}
+&#43;
+&#43;	reviewContext, err := u.collector.Collect(ctx, review.CollectOptions{
+&#43;		RepositoryPath: resolved.RepositoryPath,
+&#43;		BaseRef:        resolved.BaseRef,
+&#43;		HeadRef:        resolved.HeadRef,
+&#43;		EventPath:      resolved.EventPath,
+&#43;		CI:             resolved.CI,
+&#43;	})
+&#43;	if err != nil {
+&#43;		return fmt.Errorf(&#34;collect review context: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	client, err := u.factory.Client(ctx, ProviderConfig{
+&#43;		Provider:    resolved.Provider,
+&#43;		APIKey:      resolved.APIKey,
+&#43;		Model:       resolved.Model,
+&#43;		ProviderURL: resolved.ProviderURL,
+&#43;	})
+&#43;	if err != nil {
+&#43;		return fmt.Errorf(&#34;create %s client: %w&#34;, resolved.Provider, err)
+&#43;	}
+&#43;
+&#43;	markdown, err := client.GenerateMarkdown(ctx, BuildPrompt(reviewContext))
+&#43;	if err != nil {
+&#43;		return fmt.Errorf(&#34;generate review markdown: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	if strings.TrimSpace(markdown) == &#34;&#34; {
+&#43;		return errors.New(&#34;generate review markdown: provider returned empty content&#34;)
+&#43;	}
+&#43;
+&#43;	if err := u.renderer.Render(ctx, out, reviewContext, markdown); err != nil {
+&#43;		return fmt.Errorf(&#34;render html: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	return nil
+&#43;}
+&#43;
+&#43;type resolvedOptions struct {
+&#43;	RepositoryPath string
+&#43;	BaseRef        string
+&#43;	HeadRef        string
+&#43;	EventPath      string
+&#43;	Provider       Provider
+&#43;	APIKey         string
+&#43;	Model          string
+&#43;	ProviderURL    string
+&#43;	CI             review.CIContext
+&#43;}
+&#43;
+&#43;func (u *GenerateReviewUseCase) resolveOptions(opts GenerateReviewOptions) (resolvedOptions, error) {
+&#43;	provider, err := parseProvider(opts.Provider)
+&#43;	if err != nil {
+&#43;		return resolvedOptions{}, err
+&#43;	}
+&#43;
+&#43;	keyName := providerAPIKeyName(provider)
+&#43;	apiKey := envValue(u.env, keyName)
+&#43;	if !providerAllowsBlankKey(provider, opts.ProviderURL) &amp;&amp; strings.TrimSpace(apiKey) == &#34;&#34; {
+&#43;		return resolvedOptions{}, fmt.Errorf(&#34;%s must be set when --provider %s is used&#34;, keyName, provider)
+&#43;	}
+&#43;
+&#43;	ci := u.githubActionsContext()
+&#43;	resolved := resolvedOptions{
+&#43;		RepositoryPath: defaultString(opts.RepositoryPath, &#34;.&#34;),
+&#43;		BaseRef:        resolveBaseRef(opts.BaseRef, ci.BaseRef),
+&#43;		HeadRef:        defaultString(opts.HeadRef, &#34;HEAD&#34;),
+&#43;		EventPath:      defaultString(opts.EventPath, envValue(u.env, &#34;GITHUB_EVENT_PATH&#34;)),
+&#43;		Provider:       provider,
+&#43;		APIKey:         apiKey,
+&#43;		Model:          resolveModel(opts.Model, provider, u.env),
+&#43;		ProviderURL:    opts.ProviderURL,
+&#43;		CI:             ci,
+&#43;	}
+&#43;
+&#43;	return resolved, nil
+&#43;}
+&#43;
+&#43;func providerAllowsBlankKey(provider Provider, providerURL string) bool {
+&#43;	return provider == ProviderGemini &amp;&amp; providerURL != &#34;&#34;
+&#43;}
+&#43;
+&#43;func parseProvider(value string) (Provider, error) {
+&#43;	switch Provider(strings.TrimSpace(value)) {
+&#43;	case ProviderGemini:
+&#43;		return ProviderGemini, nil
+&#43;	case ProviderGrok:
+&#43;		return ProviderGrok, nil
+&#43;	case &#34;&#34;:
+&#43;		return &#34;&#34;, errors.New(&#34;provider must be one of: gemini, grok&#34;)
+&#43;	default:
+&#43;		return &#34;&#34;, fmt.Errorf(&#34;unsupported provider %q; expected one of: gemini, grok&#34;, value)
+&#43;	}
+&#43;}
+&#43;
+&#43;func providerAPIKeyName(provider Provider) string {
+&#43;	switch provider {
+&#43;	case ProviderGemini:
+&#43;		return &#34;GEMINI_API_KEY&#34;
+&#43;	case ProviderGrok:
+&#43;		return &#34;XAI_API_KEY&#34;
+&#43;	default:
+&#43;		return &#34;&#34;
+&#43;	}
+&#43;}
+&#43;
+&#43;func resolveBaseRef(flagValue string, githubBaseRef string) string {
+&#43;	if flagValue != &#34;&#34; {
+&#43;		return flagValue
+&#43;	}
+&#43;
+&#43;	if githubBaseRef != &#34;&#34; {
+&#43;		return &#34;origin/&#34; &#43; githubBaseRef
+&#43;	}
+&#43;
+&#43;	return &#34;origin/main&#34;
+&#43;}
+&#43;
+&#43;func resolveModel(flagValue string, provider Provider, env Environment) string {
+&#43;	if flagValue != &#34;&#34; {
+&#43;		return flagValue
+&#43;	}
+&#43;
+&#43;	if value := envValue(env, &#34;PRBUDDY_MODEL&#34;); value != &#34;&#34; {
+&#43;		return value
+&#43;	}
+&#43;
+&#43;	switch provider {
+&#43;	case ProviderGemini:
+&#43;		return envValue(env, &#34;PRBUDDY_GEMINI_MODEL&#34;)
+&#43;	case ProviderGrok:
+&#43;		return envValue(env, &#34;PRBUDDY_GROK_MODEL&#34;)
+&#43;	default:
+&#43;		return &#34;&#34;
+&#43;	}
+&#43;}
+&#43;
+&#43;func (u *GenerateReviewUseCase) githubActionsContext() review.CIContext {
+&#43;	return review.CIContext{
+&#43;		GitHubActions: envValue(u.env, &#34;GITHUB_ACTIONS&#34;) == &#34;true&#34;,
+&#43;		Repository:    envValue(u.env, &#34;GITHUB_REPOSITORY&#34;),
+&#43;		SHA:           envValue(u.env, &#34;GITHUB_SHA&#34;),
+&#43;		EventName:     envValue(u.env, &#34;GITHUB_EVENT_NAME&#34;),
+&#43;		ServerURL:     envValue(u.env, &#34;GITHUB_SERVER_URL&#34;),
+&#43;		BaseRef:       envValue(u.env, &#34;GITHUB_BASE_REF&#34;),
+&#43;		HeadRef:       envValue(u.env, &#34;GITHUB_HEAD_REF&#34;),
+&#43;	}
+&#43;}
+&#43;
+&#43;func defaultString(value string, fallback string) string {
+&#43;	if value != &#34;&#34; {
+&#43;		return value
+&#43;	}
+&#43;
+&#43;	return fallback
+&#43;}
+&#43;
+&#43;func envValue(env Environment, name string) string {
+&#43;	value, ok := env.LookupEnv(name)
+&#43;	if !ok {
+&#43;		return &#34;&#34;
+&#43;	}
+&#43;
+&#43;	return value
+&#43;}
+diff --git a/app/generate_test.go b/app/generate_test.go
+new file mode 100644
+index 0000000..2156c31
+--- /dev/null
+&#43;&#43;&#43; b/app/generate_test.go
+@@ -0,0 &#43;1,206 @@
+&#43;package app
+&#43;
+&#43;import (
+&#43;	&#34;bytes&#34;
+&#43;	&#34;context&#34;
+&#43;	&#34;io&#34;
+&#43;	&#34;strings&#34;
+&#43;	&#34;testing&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/llm&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;func TestGenerateReviewUsesProviderAndRendersMarkdown(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	var stdout bytes.Buffer
+&#43;	collector := &amp;fakeReviewCollector{
+&#43;		context: review.Context{
+&#43;			Repository: review.Repository{Name: &#34;prbuddy&#34;},
+&#43;		},
+&#43;	}
+&#43;	factory := &amp;fakeLLMFactory{
+&#43;		client: fakeLLMClient{markdown: &#34;## Review\n\nLooks good.&#34;},
+&#43;	}
+&#43;	renderer := fakeDocumentRenderer{}
+&#43;	env := MapEnvironment{
+&#43;		&#34;GEMINI_API_KEY&#34;:       &#34;gemini-key&#34;,
+&#43;		&#34;GITHUB_ACTIONS&#34;:       &#34;true&#34;,
+&#43;		&#34;GITHUB_BASE_REF&#34;:      &#34;main&#34;,
+&#43;		&#34;GITHUB_HEAD_REF&#34;:      &#34;feature&#34;,
+&#43;		&#34;GITHUB_EVENT_PATH&#34;:    &#34;event.json&#34;,
+&#43;		&#34;GITHUB_REPOSITORY&#34;:    &#34;pangobit/prbuddy&#34;,
+&#43;		&#34;GITHUB_SHA&#34;:           &#34;abc123&#34;,
+&#43;		&#34;GITHUB_EVENT_NAME&#34;:    &#34;pull_request&#34;,
+&#43;		&#34;GITHUB_SERVER_URL&#34;:    &#34;https://github.com&#34;,
+&#43;		&#34;PRBUDDY_GEMINI_MODEL&#34;: &#34;gemini-test&#34;,
+&#43;	}
+&#43;	useCase := NewGenerateReviewUseCase(collector, factory, renderer, env)
+&#43;
+&#43;	err := useCase.GenerateReview(context.Background(), &amp;stdout, GenerateReviewOptions{
+&#43;		RepositoryPath: &#34;.&#34;,
+&#43;		Provider:       &#34;gemini&#34;,
+&#43;		ProviderURL:    &#34;https://ai&#34;,
+&#43;	})
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;generate review: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if collector.got.BaseRef != &#34;origin/main&#34; {
+&#43;		t.Fatalf(&#34;base ref = %q&#34;, collector.got.BaseRef)
+&#43;	}
+&#43;
+&#43;	if collector.got.HeadRef != &#34;HEAD&#34; {
+&#43;		t.Fatalf(&#34;head ref = %q&#34;, collector.got.HeadRef)
+&#43;	}
+&#43;
+&#43;	if collector.got.EventPath != &#34;event.json&#34; {
+&#43;		t.Fatalf(&#34;event path = %q&#34;, collector.got.EventPath)
+&#43;	}
+&#43;
+&#43;	if factory.got.APIKey != &#34;gemini-key&#34; {
+&#43;		t.Fatalf(&#34;api key = %q&#34;, factory.got.APIKey)
+&#43;	}
+&#43;
+&#43;	if factory.got.Model != &#34;gemini-test&#34; {
+&#43;		t.Fatalf(&#34;model = %q&#34;, factory.got.Model)
+&#43;	}
+&#43;
+&#43;	if factory.got.ProviderURL != &#34;https://ai&#34; {
+&#43;		t.Fatalf(&#34;provider url = %q&#34;, factory.got.ProviderURL)
+&#43;	}
+&#43;
+&#43;	if !strings.Contains(factory.client.got.User, &#34;Pull Request Review Context&#34;) {
+&#43;		t.Fatalf(&#34;prompt user = %q&#34;, factory.client.got.User)
+&#43;	}
+&#43;
+&#43;	if got := stdout.String(); got != &#34;## Review\n\nLooks good.&#34; {
+&#43;		t.Fatalf(&#34;stdout = %q&#34;, got)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestGenerateReviewFailsBeforeCollectingWithoutProviderKey(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	collector := &amp;fakeReviewCollector{}
+&#43;	useCase := NewGenerateReviewUseCase(collector, &amp;fakeLLMFactory{}, fakeDocumentRenderer{}, MapEnvironment{})
+&#43;
+&#43;	err := useCase.GenerateReview(context.Background(), io.Discard, GenerateReviewOptions{
+&#43;		Provider: &#34;grok&#34;,
+&#43;	})
+&#43;	if err == nil {
+&#43;		t.Fatal(&#34;expected error&#34;)
+&#43;	}
+&#43;
+&#43;	if !strings.Contains(err.Error(), &#34;XAI_API_KEY must be set&#34;) {
+&#43;		t.Fatalf(&#34;error = %q&#34;, err)
+&#43;	}
+&#43;
+&#43;	if collector.called {
+&#43;		t.Fatal(&#34;collector was called&#34;)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestGenerateReviewAllowsGeminiCustomURLWithoutProviderKey(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	var stdout bytes.Buffer
+&#43;	collector := &amp;fakeReviewCollector{}
+&#43;	factory := &amp;fakeLLMFactory{
+&#43;		client: fakeLLMClient{markdown: &#34;## Review&#34;},
+&#43;	}
+&#43;	useCase := NewGenerateReviewUseCase(collector, factory, fakeDocumentRenderer{}, MapEnvironment{})
+&#43;
+&#43;	err := useCase.GenerateReview(context.Background(), &amp;stdout, GenerateReviewOptions{
+&#43;		Provider:    &#34;gemini&#34;,
+&#43;		ProviderURL: &#34;https://ai&#34;,
+&#43;	})
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;generate review: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if factory.got.APIKey != &#34;&#34; {
+&#43;		t.Fatalf(&#34;api key = %q&#34;, factory.got.APIKey)
+&#43;	}
+&#43;
+&#43;	if factory.got.ProviderURL != &#34;https://ai&#34; {
+&#43;		t.Fatalf(&#34;provider url = %q&#34;, factory.got.ProviderURL)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestGenerateReviewRejectsUnsupportedProvider(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	useCase := NewGenerateReviewUseCase(&amp;fakeReviewCollector{}, &amp;fakeLLMFactory{}, fakeDocumentRenderer{}, MapEnvironment{})
+&#43;
+&#43;	err := useCase.GenerateReview(context.Background(), io.Discard, GenerateReviewOptions{
+&#43;		Provider: &#34;other&#34;,
+&#43;	})
+&#43;	if err == nil {
+&#43;		t.Fatal(&#34;expected error&#34;)
+&#43;	}
+&#43;
+&#43;	if !strings.Contains(err.Error(), &#34;unsupported provider&#34;) {
+&#43;		t.Fatalf(&#34;error = %q&#34;, err)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestBuildPromptRequestsRichMarkdownReviewDocument(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	prompt := BuildPrompt(review.Context{})
+&#43;	required := []string{
+&#43;		&#34;Return Markdown only.&#34;,
+&#43;		&#34;fenced code snippets&#34;,
+&#43;		&#34;Mermaid diagrams&#34;,
+&#43;		&#34;Side Effects and Risks&#34;,
+&#43;		&#34;Review Comments&#34;,
+&#43;		&#34;Suggested comment&#34;,
+&#43;	}
+&#43;
+&#43;	for _, want := range required {
+&#43;		if !strings.Contains(prompt.System&#43;&#34;\n&#34;&#43;prompt.User, want) {
+&#43;			t.Fatalf(&#34;prompt missing %q in:\n%s\n%s&#34;, want, prompt.System, prompt.User)
+&#43;		}
+&#43;	}
+&#43;}
+&#43;
+&#43;type fakeReviewCollector struct {
+&#43;	context review.Context
+&#43;	got     review.CollectOptions
+&#43;	called  bool
+&#43;}
+&#43;
+&#43;func (c *fakeReviewCollector) Collect(_ context.Context, opts review.CollectOptions) (review.Context, error) {
+&#43;	c.got = opts
+&#43;	c.called = true
+&#43;	return c.context, nil
+&#43;}
+&#43;
+&#43;type fakeLLMFactory struct {
+&#43;	client fakeLLMClient
+&#43;	got    ProviderConfig
+&#43;}
+&#43;
+&#43;func (f *fakeLLMFactory) Client(_ context.Context, config ProviderConfig) (LLMClient, error) {
+&#43;	f.got = config
+&#43;	return &amp;f.client, nil
+&#43;}
+&#43;
+&#43;type fakeLLMClient struct {
+&#43;	markdown string
+&#43;	got      llm.Prompt
+&#43;}
+&#43;
+&#43;func (c *fakeLLMClient) GenerateMarkdown(_ context.Context, prompt llm.Prompt) (string, error) {
+&#43;	c.got = prompt
+&#43;	return c.markdown, nil
+&#43;}
+&#43;
+&#43;type fakeDocumentRenderer struct{}
+&#43;
+&#43;func (r fakeDocumentRenderer) Render(_ context.Context, out io.Writer, _ review.Context, markdown string) error {
+&#43;	_, err := io.WriteString(out, markdown)
+&#43;	return err
+&#43;}
+diff --git a/app/prompt.go b/app/prompt.go
+new file mode 100644
+index 0000000..4c38468
+--- /dev/null
+&#43;&#43;&#43; b/app/prompt.go
+@@ -0,0 &#43;1,129 @@
+&#43;package app
+&#43;
+&#43;import (
+&#43;	&#34;fmt&#34;
+&#43;	&#34;strings&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/llm&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;// BuildPrompt creates the temporary v1 prompt for an LLM review guide.
+&#43;func BuildPrompt(ctx review.Context) llm.Prompt {
+&#43;	return llm.Prompt{
+&#43;		System: placeholderSystemPrompt(),
+&#43;		User:   placeholderUserPrompt(ctx),
+&#43;	}
+&#43;}
+&#43;
+&#43;func placeholderSystemPrompt() string {
+&#43;	return strings.TrimSpace(`
+&#43;You are PR Buddy, an expert software reviewer.
+&#43;Return Markdown only.
+&#43;Create a human-ready pull request review document that helps a reviewer understand the change beyond the raw diff.
+&#43;Use concrete evidence from the supplied commits, changed files, and diff.
+&#43;Use concise prose, Markdown tables, fenced code snippets, and Mermaid diagrams when they clarify flow or dependencies.
+&#43;Explain execution flow, side effects, data or state changes, operational risk, and testing implications.
+&#43;Include structured review comments a human can paste into a PR when specific concerns are visible.
+&#43;Do not invent facts. If evidence is missing, call that out as an open question.
+&#43;Do not wrap the response in HTML and do not include raw HTML.
+&#43;`)
+&#43;}
+&#43;
+&#43;func placeholderUserPrompt(ctx review.Context) string {
+&#43;	var b strings.Builder
+&#43;
+&#43;	writeLine(&amp;b, &#34;# Pull Request Review Context&#34;)
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Repository&#34;)
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Name: %s&#34;, ctx.Repository.Name))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Root: %s&#34;, ctx.Repository.Root))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Remote: %s&#34;, emptyFallback(ctx.Repository.RemoteURL, &#34;unknown&#34;)))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- GitHub repository: %s&#34;, emptyFallback(ctx.CI.Repository, &#34;unknown&#34;)))
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Comparison&#34;)
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Base ref: %s&#34;, ctx.Comparison.BaseRef))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Head ref: %s&#34;, ctx.Comparison.HeadRef))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- Merge base: %s&#34;, ctx.Comparison.MergeBase))
+&#43;	writeLine(&amp;b, fmt.Sprintf(&#34;- GitHub SHA: %s&#34;, emptyFallback(ctx.CI.SHA, &#34;unknown&#34;)))
+&#43;
+&#43;	if ctx.PullRequest != nil {
+&#43;		writeLine(&amp;b, &#34;&#34;)
+&#43;		writeLine(&amp;b, &#34;## Pull Request Metadata&#34;)
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- Number: %d&#34;, ctx.PullRequest.Number))
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- Title: %s&#34;, emptyFallback(ctx.PullRequest.Title, &#34;unknown&#34;)))
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- Author: %s&#34;, emptyFallback(ctx.PullRequest.Author, &#34;unknown&#34;)))
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- URL: %s&#34;, emptyFallback(ctx.PullRequest.URL, &#34;unknown&#34;)))
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- Base: %s&#34;, emptyFallback(ctx.PullRequest.BaseRef, &#34;unknown&#34;)))
+&#43;		writeLine(&amp;b, fmt.Sprintf(&#34;- Head: %s&#34;, emptyFallback(ctx.PullRequest.HeadRef, &#34;unknown&#34;)))
+&#43;		writeLine(&amp;b, &#34;&#34;)
+&#43;		writeLine(&amp;b, &#34;### Pull Request Body&#34;)
+&#43;		writeLine(&amp;b, emptyFallback(ctx.PullRequest.Body, &#34;No PR body provided.&#34;))
+&#43;	}
+&#43;
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Commits&#34;)
+&#43;	if len(ctx.Commits) == 0 {
+&#43;		writeLine(&amp;b, &#34;- No commits found.&#34;)
+&#43;	} else {
+&#43;		for _, commit := range ctx.Commits {
+&#43;			writeLine(&amp;b, fmt.Sprintf(&#34;- %s %s by %s&#34;, shortHash(commit.Hash), commit.Subject, commit.Author))
+&#43;		}
+&#43;	}
+&#43;
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Changed Files&#34;)
+&#43;	if len(ctx.Files) == 0 {
+&#43;		writeLine(&amp;b, &#34;- No changed files found.&#34;)
+&#43;	} else {
+&#43;		for _, file := range ctx.Files {
+&#43;			writeLine(&amp;b, fmt.Sprintf(&#34;- %s %s (&#43;%d/-%d)&#34;, file.Status, file.Path, file.Additions, file.Deletions))
+&#43;		}
+&#43;	}
+&#43;
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Diff&#34;)
+&#43;	writeLine(&amp;b, &#34;```diff&#34;)
+&#43;	writeLine(&amp;b, ctx.Diff)
+&#43;	writeLine(&amp;b, &#34;```&#34;)
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;## Requested Review Document Shape&#34;)
+&#43;	writeLine(&amp;b, &#34;Return Markdown with these sections when evidence supports them:&#34;)
+&#43;	writeLine(&amp;b, &#34;- Executive Summary&#34;)
+&#43;	writeLine(&amp;b, &#34;- Change Flow&#34;)
+&#43;	writeLine(&amp;b, &#34;- Side Effects and Risks&#34;)
+&#43;	writeLine(&amp;b, &#34;- Key Code Snippets&#34;)
+&#43;	writeLine(&amp;b, &#34;- Review Comments&#34;)
+&#43;	writeLine(&amp;b, &#34;- Verification Guidance&#34;)
+&#43;	writeLine(&amp;b, &#34;- Open Questions&#34;)
+&#43;	writeLine(&amp;b, &#34;&#34;)
+&#43;	writeLine(&amp;b, &#34;For review comments, use this structure:&#34;)
+&#43;	writeLine(&amp;b, &#34;```text&#34;)
+&#43;	writeLine(&amp;b, &#34;File: &lt;path&gt;&#34;)
+&#43;	writeLine(&amp;b, &#34;Concern: &lt;specific concern&gt;&#34;)
+&#43;	writeLine(&amp;b, &#34;Suggested comment: &lt;paste-ready review comment&gt;&#34;)
+&#43;	writeLine(&amp;b, &#34;```&#34;)
+&#43;
+&#43;	return b.String()
+&#43;}
+&#43;
+&#43;func writeLine(b *strings.Builder, value string) {
+&#43;	b.WriteString(value)
+&#43;	b.WriteByte(&#39;\n&#39;)
+&#43;}
+&#43;
+&#43;func emptyFallback(value string, fallback string) string {
+&#43;	if strings.TrimSpace(value) == &#34;&#34; {
+&#43;		return fallback
+&#43;	}
+&#43;
+&#43;	return value
+&#43;}
+&#43;
+&#43;func shortHash(hash string) string {
+&#43;	if len(hash) &lt;= 7 {
+&#43;		return hash
+&#43;	}
+&#43;
+&#43;	return hash[:7]
+&#43;}
+diff --git a/cmd/prbuddy/main.go b/cmd/prbuddy/main.go
+new file mode 100644
+index 0000000..32bd897
+--- /dev/null
+&#43;&#43;&#43; b/cmd/prbuddy/main.go
+@@ -0,0 &#43;1,49 @@
+&#43;// Package main provides the prbuddy executable.
+&#43;package main
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;errors&#34;
+&#43;	&#34;fmt&#34;
+&#43;	&#34;os&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/api/cli&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/app&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/connectors/gemini&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/connectors/grok&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/render&#34;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;func main() {
+&#43;	env := app.NewEnvironment(os.Environ())
+&#43;	useCase := app.NewGenerateReviewUseCase(
+&#43;		review.NewGitCollector(&#34;.&#34;),
+&#43;		app.LLMFactoryFunc(newLLMClient),
+&#43;		render.NewHTMLRenderer(),
+&#43;		env,
+&#43;	)
+&#43;	cmd := cli.NewRootCommand(
+&#43;		os.Stdout,
+&#43;		os.Stderr,
+&#43;		useCase,
+&#43;	)
+&#43;
+&#43;	if err := cmd.Execute(); err != nil {
+&#43;		if _, writeErr := fmt.Fprintln(os.Stderr, err); writeErr != nil {
+&#43;			os.Exit(1)
+&#43;		}
+&#43;		os.Exit(1)
+&#43;	}
+&#43;}
+&#43;
+&#43;func newLLMClient(ctx context.Context, config app.ProviderConfig) (app.LLMClient, error) {
+&#43;	switch config.Provider {
+&#43;	case app.ProviderGemini:
+&#43;		return gemini.NewClient(ctx, config.APIKey, config.Model, config.ProviderURL)
+&#43;	case app.ProviderGrok:
+&#43;		return grok.NewClient(config.APIKey, config.Model), nil
+&#43;	default:
+&#43;		return nil, errors.New(&#34;unknown provider&#34;)
+&#43;	}
+&#43;}
+diff --git a/connectors/gemini/gemini.go b/connectors/gemini/gemini.go
+new file mode 100644
+index 0000000..2e89550
+--- /dev/null
+&#43;&#43;&#43; b/connectors/gemini/gemini.go
+@@ -0,0 &#43;1,73 @@
+&#43;// Package gemini adapts Google&#39;s Gemini SDK to PR Buddy&#39;s app port.
+&#43;package gemini
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;errors&#34;
+&#43;	&#34;strings&#34;
+&#43;
+&#43;	&#34;google.golang.org/genai&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/llm&#34;
+&#43;)
+&#43;
+&#43;const defaultModel = &#34;gemini-2.5-flash&#34;
+&#43;const proxyPlaceholderKey = &#34;prbuddy-proxy&#34;
+&#43;
+&#43;// Client generates review markdown with Gemini.
+&#43;type Client struct {
+&#43;	client *genai.Client
+&#43;	model  string
+&#43;}
+&#43;
+&#43;// NewClient creates a Gemini-backed LLM client.
+&#43;func NewClient(ctx context.Context, apiKey string, model string, providerURL string) (*Client, error) {
+&#43;	if providerURL != &#34;&#34; &amp;&amp; apiKey == &#34;&#34; {
+&#43;		apiKey = proxyPlaceholderKey
+&#43;	}
+&#43;
+&#43;	config := &amp;genai.ClientConfig{
+&#43;		APIKey:  apiKey,
+&#43;		Backend: genai.BackendGeminiAPI,
+&#43;	}
+&#43;	if providerURL != &#34;&#34; {
+&#43;		config.HTTPOptions = genai.HTTPOptions{BaseURL: providerURL}
+&#43;	}
+&#43;
+&#43;	client, err := genai.NewClient(ctx, config)
+&#43;	if err != nil {
+&#43;		return nil, err
+&#43;	}
+&#43;
+&#43;	return &amp;Client{
+&#43;		client: client,
+&#43;		model:  defaultString(model, defaultModel),
+&#43;	}, nil
+&#43;}
+&#43;
+&#43;// GenerateMarkdown generates markdown review content.
+&#43;func (c *Client) GenerateMarkdown(ctx context.Context, prompt llm.Prompt) (string, error) {
+&#43;	response, err := c.client.Models.GenerateContent(ctx, c.model, genai.Text(joinPrompt(prompt)), nil)
+&#43;	if err != nil {
+&#43;		return &#34;&#34;, err
+&#43;	}
+&#43;
+&#43;	text := strings.TrimSpace(response.Text())
+&#43;	if text == &#34;&#34; {
+&#43;		return &#34;&#34;, errors.New(&#34;gemini returned empty content&#34;)
+&#43;	}
+&#43;
+&#43;	return text, nil
+&#43;}
+&#43;
+&#43;func joinPrompt(prompt llm.Prompt) string {
+&#43;	return prompt.System &#43; &#34;\n\n&#34; &#43; prompt.User
+&#43;}
+&#43;
+&#43;func defaultString(value string, fallback string) string {
+&#43;	if value != &#34;&#34; {
+&#43;		return value
+&#43;	}
+&#43;
+&#43;	return fallback
+&#43;}
+diff --git a/connectors/gemini/gemini_test.go b/connectors/gemini/gemini_test.go
+new file mode 100644
+index 0000000..ceaf1b4
+--- /dev/null
+&#43;&#43;&#43; b/connectors/gemini/gemini_test.go
+@@ -0,0 &#43;1,19 @@
+&#43;package gemini
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;testing&#34;
+&#43;)
+&#43;
+&#43;func TestNewClientAllowsCustomURLWithoutRealAPIKey(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	client, err := NewClient(context.Background(), &#34;&#34;, &#34;&#34;, &#34;https://ai&#34;)
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;new client: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if client.model != defaultModel {
+&#43;		t.Fatalf(&#34;model = %q&#34;, client.model)
+&#43;	}
+&#43;}
+diff --git a/connectors/grok/grok.go b/connectors/grok/grok.go
+new file mode 100644
+index 0000000..e238e76
+--- /dev/null
+&#43;&#43;&#43; b/connectors/grok/grok.go
+@@ -0,0 &#43;1,68 @@
+&#43;// Package grok adapts xAI&#39;s OpenAI-compatible API to PR Buddy&#39;s app port.
+&#43;package grok
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;errors&#34;
+&#43;	&#34;strings&#34;
+&#43;
+&#43;	&#34;github.com/openai/openai-go/v3&#34;
+&#43;	&#34;github.com/openai/openai-go/v3/option&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/llm&#34;
+&#43;)
+&#43;
+&#43;const (
+&#43;	defaultBaseURL = &#34;https://api.x.ai/v1&#34;
+&#43;	defaultModel   = &#34;grok-4.3-latest&#34;
+&#43;)
+&#43;
+&#43;// Client generates review markdown with Grok.
+&#43;type Client struct {
+&#43;	client openai.Client
+&#43;	model  string
+&#43;}
+&#43;
+&#43;// NewClient creates a Grok-backed LLM client.
+&#43;func NewClient(apiKey string, model string) *Client {
+&#43;	return &amp;Client{
+&#43;		client: openai.NewClient(
+&#43;			option.WithAPIKey(apiKey),
+&#43;			option.WithBaseURL(defaultBaseURL),
+&#43;		),
+&#43;		model: defaultString(model, defaultModel),
+&#43;	}
+&#43;}
+&#43;
+&#43;// GenerateMarkdown generates markdown review content.
+&#43;func (c *Client) GenerateMarkdown(ctx context.Context, prompt llm.Prompt) (string, error) {
+&#43;	completion, err := c.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+&#43;		Messages: []openai.ChatCompletionMessageParamUnion{
+&#43;			openai.DeveloperMessage(prompt.System),
+&#43;			openai.UserMessage(prompt.User),
+&#43;		},
+&#43;		Model: openai.ChatModel(c.model),
+&#43;	})
+&#43;	if err != nil {
+&#43;		return &#34;&#34;, err
+&#43;	}
+&#43;
+&#43;	if len(completion.Choices) == 0 {
+&#43;		return &#34;&#34;, errors.New(&#34;grok returned no choices&#34;)
+&#43;	}
+&#43;
+&#43;	text := strings.TrimSpace(completion.Choices[0].Message.Content)
+&#43;	if text == &#34;&#34; {
+&#43;		return &#34;&#34;, errors.New(&#34;grok returned empty content&#34;)
+&#43;	}
+&#43;
+&#43;	return text, nil
+&#43;}
+&#43;
+&#43;func defaultString(value string, fallback string) string {
+&#43;	if value != &#34;&#34; {
+&#43;		return value
+&#43;	}
+&#43;
+&#43;	return fallback
+&#43;}
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..f8f3aeb
+--- /dev/null
+&#43;&#43;&#43; b/go.mod
+@@ -0,0 &#43;1,38 @@
+&#43;module github.com/pangobit/prbuddy
+&#43;
+&#43;go 1.25.1
+&#43;
+&#43;require (
+&#43;	github.com/microcosm-cc/bluemonday v1.0.27
+&#43;	github.com/openai/openai-go/v3 v3.37.0
+&#43;	github.com/spf13/cobra v1.10.2
+&#43;	github.com/yuin/goldmark v1.8.2
+&#43;	google.golang.org/genai v1.58.0
+&#43;)
+&#43;
+&#43;require (
+&#43;	cloud.google.com/go v0.116.0 // indirect
+&#43;	cloud.google.com/go/auth v0.9.3 // indirect
+&#43;	cloud.google.com/go/compute/metadata v0.5.0 // indirect
+&#43;	github.com/aymerick/douceur v0.2.0 // indirect
+&#43;	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+&#43;	github.com/google/go-cmp v0.6.0 // indirect
+&#43;	github.com/google/s2a-go v0.1.8 // indirect
+&#43;	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
+&#43;	github.com/gorilla/css v1.0.1 // indirect
+&#43;	github.com/gorilla/websocket v1.5.3 // indirect
+&#43;	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+&#43;	github.com/spf13/pflag v1.0.9 // indirect
+&#43;	github.com/tidwall/gjson v1.18.0 // indirect
+&#43;	github.com/tidwall/match v1.1.1 // indirect
+&#43;	github.com/tidwall/pretty v1.2.1 // indirect
+&#43;	github.com/tidwall/sjson v1.2.5 // indirect
+&#43;	go.opencensus.io v0.24.0 // indirect
+&#43;	golang.org/x/crypto v0.36.0 // indirect
+&#43;	golang.org/x/net v0.38.0 // indirect
+&#43;	golang.org/x/sys v0.31.0 // indirect
+&#43;	golang.org/x/text v0.23.0 // indirect
+&#43;	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
+&#43;	google.golang.org/grpc v1.66.2 // indirect
+&#43;	google.golang.org/protobuf v1.34.2 // indirect
+&#43;)
+diff --git a/go.sum b/go.sum
+new file mode 100644
+index 0000000..8a823d7
+--- /dev/null
+&#43;&#43;&#43; b/go.sum
+@@ -0,0 &#43;1,155 @@
+&#43;cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM&#43;DwF1aE&#43;0xfcU&#43;56JwCaLick0ClmMTw=
+&#43;cloud.google.com/go v0.116.0 h1:B3fRrSDkLRt5qSHWe40ERJvhvnQwdZiHu0bJOpldweE=
+&#43;cloud.google.com/go v0.116.0/go.mod h1:cEPSRWPzZEswwdr9BxE6ChEn01dWlTaF05LiC2Xs70U=
+&#43;cloud.google.com/go/auth v0.9.3 h1:VOEUIAADkkLtyfr3BLa3R8Ed/j6w1jTBmARx&#43;wb5w5U=
+&#43;cloud.google.com/go/auth v0.9.3/go.mod h1:7z6VY&#43;7h3KUdRov5F1i8NDP5ZzWKYmEPO842BgCsmTk=
+&#43;cloud.google.com/go/compute/metadata v0.5.0 h1:Zr0eK8JbFv6&#43;Wi4ilXAR8FJ3wyNdpxHKJNPos6LTZOY=
+&#43;cloud.google.com/go/compute/metadata v0.5.0/go.mod h1:aHnloV2TPI38yx4s9&#43;wAZhHykWvVCfu7hQbF&#43;9CWoiY=
+&#43;github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+&#43;github.com/aymerick/douceur v0.2.0 h1:Mv&#43;mAeH1Q&#43;n9Fr&#43;oyamOlAkUNPWPlA8PPGR0QAaYuPk=
+&#43;github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
+&#43;github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
+&#43;github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
+&#43;github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6&#43;tZqaGXZJjfX53e64911xZQV5JYwmTeXPW&#43;k8Sc=
+&#43;github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
+&#43;github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI&#43;c5H38=
+&#43;github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI&#43;c5H38=
+&#43;github.com/envoyproxy/go-control-plane v0.9.0/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
+&#43;github.com/envoyproxy/go-control-plane v0.9.1-0.20191026205805-5f8ba28d4473/go.mod h1:YTl/9mNaCwkRvm6d1a2C3ymFceY/DCBVvsKhRF0iEA4=
+&#43;github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1mIlRU8Am5FuJP05cCM98=
+&#43;github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7&#43;kN2VEUnK/pcBlmesArF7c=
+&#43;github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
+&#43;github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e/go.mod h1:cIg4eruTrX1D&#43;g88fzRXU5OdNfaM&#43;9IcxsU14FzY7Hc=
+&#43;github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da h1:oI5xCqsCo564l8iNU&#43;DwB5epxmsaqB&#43;rhGL0m5jtYqE=
+&#43;github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da/go.mod h1:cIg4eruTrX1D&#43;g88fzRXU5OdNfaM&#43;9IcxsU14FzY7Hc=
+&#43;github.com/golang/mock v1.1.1/go.mod h1:oTYuIxOrZwtPieC&#43;H1uAHpcLFnEyAGVDL/k47Jfbm0A=
+&#43;github.com/golang/protobuf v1.2.0/go.mod h1:6lQm79b&#43;lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=
+&#43;github.com/golang/protobuf v1.3.2/go.mod h1:6lQm79b&#43;lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=
+&#43;github.com/golang/protobuf v1.4.0-rc.1/go.mod h1:ceaxUfeHdC40wWswd/P6IGgMaK3YpKi5j83Wpe3EHw8=
+&#43;github.com/golang/protobuf v1.4.0-rc.1.0.20200221234624-67d41d38c208/go.mod h1:xKAWHe0F5eneWXFV3EuXVDTCmh&#43;JuBKY0li0aMyXATA=
+&#43;github.com/golang/protobuf v1.4.0-rc.2/go.mod h1:LlEzMj4AhA7rCAGe4KMBDvJI&#43;AwstrUpVNzEA03Pprs=
+&#43;github.com/golang/protobuf v1.4.0-rc.4.0.20200313231945-b860323f09d0/go.mod h1:WU3c8KckQ9AFe&#43;yFwt9sWVRKCVIyN9cPHBJSNnbL67w=
+&#43;github.com/golang/protobuf v1.4.0/go.mod h1:jodUvKwWbYaEsadDk5Fwe5c77LiNKVO9IDvqG2KuDX0=
+&#43;github.com/golang/protobuf v1.4.1/go.mod h1:U8fpvMrcmy5pZrNK1lt4xCsGvpyWQ/VVv6QDs8UjoX8=
+&#43;github.com/golang/protobuf v1.4.3/go.mod h1:oDoupMAO8OvCJWAcko0GGGIgR6R6ocIYbsSw735rRwI=
+&#43;github.com/google/go-cmp v0.2.0/go.mod h1:oXzfMopK8JAjlY9xF4vHSVASa0yLyX7SntLO5aqRK0M=
+&#43;github.com/google/go-cmp v0.3.0/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
+&#43;github.com/google/go-cmp v0.3.1/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
+&#43;github.com/google/go-cmp v0.4.0/go.mod h1:v8dTdLbMG2kIc/vJvl&#43;f65V22dbkXbowE6jgT/gNBxE=
+&#43;github.com/google/go-cmp v0.5.0/go.mod h1:v8dTdLbMG2kIc/vJvl&#43;f65V22dbkXbowE6jgT/gNBxE=
+&#43;github.com/google/go-cmp v0.5.3/go.mod h1:v8dTdLbMG2kIc/vJvl&#43;f65V22dbkXbowE6jgT/gNBxE=
+&#43;github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
+&#43;github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0&#43;DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
+&#43;github.com/google/s2a-go v0.1.8 h1:zZDs9gcbt9ZPLV0ndSyQk6Kacx2g/X&#43;SKYovpnz3SMM=
+&#43;github.com/google/s2a-go v0.1.8/go.mod h1:6iNWHTpQ&#43;nfNRN5E00MSdfDwVesa8hhS32PhPO8deJA=
+&#43;github.com/google/uuid v1.1.2/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT&#43;nhxU&#43;yHo=
+&#43;github.com/googleapis/enterprise-certificate-proxy v0.3.4 h1:XYIDZApgAnrN1c855gTgghdIA6Stxb52D5RnLI1SLyw=
+&#43;github.com/googleapis/enterprise-certificate-proxy v0.3.4/go.mod h1:YKe7cfqYXjKGpGvmSg28/fFvhNzinZQm8DGnaburhGA=
+&#43;github.com/gorilla/css v1.0.1 h1:ntNaBIghp6JmvWnxbZKANoLyuXTPZ4cAMlo6RyhlbO8=
+&#43;github.com/gorilla/css v1.0.1/go.mod h1:BvnYkspnSzMmwRK&#43;b8/xgNPLiIuNZr6vbZBTPQ2A3b0=
+&#43;github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u&#43;bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+&#43;github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55&#43;EU/adAjf1fMHhE=
+&#43;github.com/inconshreveable/mousetrap v1.1.0 h1:wN&#43;x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
+&#43;github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
+&#43;github.com/microcosm-cc/bluemonday v1.0.27 h1:MpEUotklkwCSLeH&#43;Qdx1VJgNqLlpY2KXwXFM08ygZfk=
+&#43;github.com/microcosm-cc/bluemonday v1.0.27/go.mod h1:jFi9vgW&#43;H7c3V0lb6nR74Ib/DIB5OBs92Dimizgw2cA=
+&#43;github.com/openai/openai-go/v3 v3.37.0 h1:4OG68yZgnxZpwzebO&#43;ZDUNkFJKKwKgzilMQq30nsouE=
+&#43;github.com/openai/openai-go/v3 v3.37.0/go.mod h1:cdufnVK14cWcT9qA1rRtrXx4FTRsgbDPW7Ia7SS5cZo=
+&#43;github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+&#43;github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
+&#43;github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:&#43;Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+&#43;github.com/spf13/cobra v1.10.2 h1:DMTTonx5m65Ic0GOoRY2c16WCbHxOOw6xxezuLaBpcU=
+&#43;github.com/spf13/cobra v1.10.2/go.mod h1:7C1pvHqHw5A4vrJfjNwvOdzYu0Gml16OCs2GRiTUUS4=
+&#43;github.com/spf13/pflag v1.0.9 h1:9exaQaMOCwffKiiiYk6/BndUBv&#43;iRViNW&#43;4lEMi0PvY=
+&#43;github.com/spf13/pflag v1.0.9/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
+&#43;github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF&#43;rwdDfMAkV7OtwuqBVzrE8GR6GFx&#43;wExME=
+&#43;github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB&#43;UWwv71VJQ9isScKT/TqJzVSSt89Yw=
+&#43;github.com/stretchr/objx v0.5.0/go.mod h1:Yh&#43;to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=
+&#43;github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+&#43;github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO&#43;kdMU&#43;MU=
+&#43;github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0&#43;kehJoqGctiVI29o6fzry7u4=
+&#43;github.com/tidwall/gjson v1.14.2/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
+&#43;github.com/tidwall/gjson v1.18.0 h1:FIDeeyB800efLX89e5a8Y0BNH&#43;LOngJyGrIWxG2FKQY=
+&#43;github.com/tidwall/gjson v1.18.0/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
+&#43;github.com/tidwall/match v1.1.1 h1:&#43;Ho715JplO36QYgwN9PGYNhgZvoUSc9X2c80KVTi&#43;GA=
+&#43;github.com/tidwall/match v1.1.1/go.mod h1:eRSPERbgtNPcGhD8UCthc6PmLEQXEWd3PRB5JTxsfmM=
+&#43;github.com/tidwall/pretty v1.2.0/go.mod h1:ITEVvHYasfjBbM0u2Pg8T2nJnzm8xPwvNhhsoaGGjNU=
+&#43;github.com/tidwall/pretty v1.2.1 h1:qjsOFOWWQl&#43;N3RsoF5/ssm1pHmJJwhjlSbZ51I6wMl4=
+&#43;github.com/tidwall/pretty v1.2.1/go.mod h1:ITEVvHYasfjBbM0u2Pg8T2nJnzm8xPwvNhhsoaGGjNU=
+&#43;github.com/tidwall/sjson v1.2.5 h1:kLy8mja&#43;1c9jlljvWTlSazM7cKDRfJuR/bOJhcY5NcY=
+&#43;github.com/tidwall/sjson v1.2.5/go.mod h1:Fvgq9kS/6ociJEDnK0Fk1cpYF4FIW6ZF7LAe&#43;6jwd28=
+&#43;github.com/yuin/goldmark v1.8.2 h1:kEGpgqJXdgbkhcOgBxkC0X0PmoPG1ZyoZ117rDVp4zE=
+&#43;github.com/yuin/goldmark v1.8.2/go.mod h1:ip/1k0VRfGynBgxOz0yCqHrbZXhcjxyuS66Brc7iBKg=
+&#43;go.opencensus.io v0.24.0 h1:y73uSU6J157QMP2kn2r30vwW1A2W2WFwSCGnAVxeaD0=
+&#43;go.opencensus.io v0.24.0/go.mod h1:vNK8G9p7aAivkbmorf4v&#43;7Hgx&#43;Zs0yY&#43;0fOtgBfjQKo=
+&#43;go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3&#43;aBEFg=
+&#43;golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0&#43;w=
+&#43;golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+&#43;golang.org/x/crypto v0.36.0 h1:AnAEvhDddvBdpY&#43;uR&#43;MyHmuZzzNqXSe/GvuDeob5L34=
+&#43;golang.org/x/crypto v0.36.0/go.mod h1:Y4J0ReaxCR1IMaabaSMugxJES1EpwhBHhv2bDHklZvc=
+&#43;golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL&#43;f9T1iT9GByDxfZKAQTCR3kQA=
+&#43;golang.org/x/lint v0.0.0-20181026193005-c67002cb31c3/go.mod h1:UVdnD1Gm6xHRNCYTkRU2/jEulfH38KcIWyp/GAMgvoE=
+&#43;golang.org/x/lint v0.0.0-20190227174305-5b3e6a55c961/go.mod h1:wehouNa3lNwaWXcvxsM5YxQ5yQlVC4a0KAMCusXpPoU=
+&#43;golang.org/x/lint v0.0.0-20190313153728-d0100b6bd8b3/go.mod h1:6SW0HCj/g11FgYtHlgUYUwCkIfeOF89ocIRzGO/8vkc=
+&#43;golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+&#43;golang.org/x/net v0.0.0-20180826012351-8a410e7b638d/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+&#43;golang.org/x/net v0.0.0-20190213061140-3a22650c66bd/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+&#43;golang.org/x/net v0.0.0-20190311183353-d8887717615a/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
+&#43;golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
+&#43;golang.org/x/net v0.0.0-20201110031124-69a78807bb2b/go.mod h1:sp8m0HH&#43;o8qH0wwXwYZr8TS3Oi6o0r6Gce1SSxlDquU=
+&#43;golang.org/x/net v0.38.0 h1:vRMAPTMaeGqVhG5QyLJHqNDwecKTomGeqbnfZyKlBI8=
+&#43;golang.org/x/net v0.38.0/go.mod h1:ivrbrMbzFq5J41QOQh0siUuly180yBYtLp&#43;CKbEaFx8=
+&#43;golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a&#43;&#43;T0U=
+&#43;golang.org/x/sync v0.0.0-20180314180146-1d60e4601c6f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+&#43;golang.org/x/sync v0.0.0-20181108010431-42b317875d0f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+&#43;golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+&#43;golang.org/x/sync v0.12.0 h1:MHc5BpPuC30uJk597Ri8TV3CNZcTLu6B6z4lJy&#43;g6Jw=
+&#43;golang.org/x/sync v0.12.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
+&#43;golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS&#43;E42TnysNCUPdjciGhY=
+&#43;golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS&#43;E42TnysNCUPdjciGhY=
+&#43;golang.org/x/sys v0.0.0-20190412213103-97732733099d/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+&#43;golang.org/x/sys v0.0.0-20200930185726-fdedc70b468f/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+&#43;golang.org/x/sys v0.31.0 h1:ioabZlmFYtWhL&#43;TRYpcnNlLwhyxaM9kWTDEmfnprqik=
+&#43;golang.org/x/sys v0.31.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
+&#43;golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW&#43;pc6Ldnwhi/IjpwHt7yyuwOQ=
+&#43;golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+&#43;golang.org/x/text v0.23.0 h1:D71I7dUrlY&#43;VX0gQShAThNGHFxZ13dGLBHQLVl1mJlY=
+&#43;golang.org/x/text v0.23.0/go.mod h1:/BLNzu4aZCJ1&#43;kcD0DNRotWKage4q2rGVAg4o22unh4=
+&#43;golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+&#43;golang.org/x/tools v0.0.0-20190114222345-bf090417da8b/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+&#43;golang.org/x/tools v0.0.0-20190226205152-f727befe758c/go.mod h1:9Yl7xja0Znq3iFh3HoIrodX9oNMXvdceNzlUR8zjMvY=
+&#43;golang.org/x/tools v0.0.0-20190311212946-11955173bddd/go.mod h1:LCzVGOaR6xXOjkQ3onu1FJEFr0SW1gC7cKk1uF8kGRs=
+&#43;golang.org/x/tools v0.0.0-20190524140312-2c0ae7006135/go.mod h1:RgjU9mgBXZiqYHBnxXauZ1Gv1EHHAz9KjViQ78xBX0Q=
+&#43;golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+&#43;google.golang.org/appengine v1.1.0/go.mod h1:EbEs0AVv82hx2wNQdGPgUI5lhzA/G0D9YwlJXL52JkM=
+&#43;google.golang.org/appengine v1.4.0/go.mod h1:xpcJRLb0r/rnEns0DIKYYv&#43;WjYCduHsrkT7/EB5XEv4=
+&#43;google.golang.org/genai v1.58.0 h1:MNA3ZkRyr7MnRwZ9RNZ60p4&#43;UMKV3yYRw6pyHq4pp0U=
+&#43;google.golang.org/genai v1.58.0/go.mod h1:A3kkl0nyBjyFlNjgxIwKq70julKbIxpSxqKO5gw/gmk=
+&#43;google.golang.org/genproto v0.0.0-20180817151627-c66870c02cf8/go.mod h1:JiN7NxoALGmiZfu7CAH4rXhgtRTLTxftemlI0sWmxmc=
+&#43;google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55/go.mod h1:DMBHOl98Agz4BDEuKkezgsaosCRResVns1a3J2ZsMNc=
+&#43;google.golang.org/genproto v0.0.0-20200526211855-cb27e3aa2013/go.mod h1:NbSheEEYHJ7i3ixzK3sjbqSGDJWnxyFXZblF3eUsNvo=
+&#43;google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 h1:pPJltXNxVzT4pK9yD8vR9X75DaWYYmLGMsEvBfFQZzQ=
+&#43;google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1/go.mod h1:UqMtugtsSgubUsoxbuAoiCXvqvErP7Gf0so0mK9tHxU=
+&#43;google.golang.org/grpc v1.19.0/go.mod h1:mqu4LbDTu4XGKhr4mRzUsmM4RtVoemTSY81AxZiDr8c=
+&#43;google.golang.org/grpc v1.23.0/go.mod h1:Y5yQAOtifL1yxbo5wqy6BxZv8vAUGQwXBOALyacEbxg=
+&#43;google.golang.org/grpc v1.25.1/go.mod h1:c3i&#43;UQWmh7LiEpx4sFZnkU36qjEYZ0imhYfXVyQciAY=
+&#43;google.golang.org/grpc v1.27.0/go.mod h1:qbnxyOmOxrQa7FizSgH&#43;ReBfzJrCY1pSN7KXBS8abTk=
+&#43;google.golang.org/grpc v1.33.2/go.mod h1:JMHMWHQWaTccqQQlmk3MJZS&#43;GWXOdAesneDmEnv2fbc=
+&#43;google.golang.org/grpc v1.66.2 h1:3QdXkuq3Bkh7w&#43;ywLdLvM56cmGvQHUMZpiCzt6Rqaoo=
+&#43;google.golang.org/grpc v1.66.2/go.mod h1:s3/l6xSSCURdVfAnL&#43;TqCNMyTDAGN6&#43;lZeVxnZR128Y=
+&#43;google.golang.org/protobuf v0.0.0-20200109180630-ec00e32a8dfd/go.mod h1:DFci5gLYBciE7Vtevhsrf46CRTquxDuWsQurQQe4oz8=
+&#43;google.golang.org/protobuf v0.0.0-20200221191635-4d8936d0db64/go.mod h1:kwYJMbMJ01Woi6D6&#43;Kah6886xMZcty6N08ah7&#43;eCXa0=
+&#43;google.golang.org/protobuf v0.0.0-20200228230310-ab0ca4ff8a60/go.mod h1:cfTl7dwQJ&#43;fmap5saPgwCLgHXTUD7jkjRqWcaiX5VyM=
+&#43;google.golang.org/protobuf v1.20.1-0.20200309200217-e05f789c0967/go.mod h1:A&#43;miEFZTKqfCUM6K7xSMQL9OKL/b6hQv&#43;e19PK&#43;JZNE=
+&#43;google.golang.org/protobuf v1.21.0/go.mod h1:47Nbq4nVaFHyn7ilMalzfO3qCViNmqZ2kzikPIcrTAo=
+&#43;google.golang.org/protobuf v1.22.0/go.mod h1:EGpADcykh3NcUnDUJcl1&#43;ZksZNG86OlYog2l/sGQquU=
+&#43;google.golang.org/protobuf v1.23.0/go.mod h1:EGpADcykh3NcUnDUJcl1&#43;ZksZNG86OlYog2l/sGQquU=
+&#43;google.golang.org/protobuf v1.23.1-0.20200526195155-81db48ad09cc/go.mod h1:EGpADcykh3NcUnDUJcl1&#43;ZksZNG86OlYog2l/sGQquU=
+&#43;google.golang.org/protobuf v1.25.0/go.mod h1:9JNX74DMeImyA3h4bdi1ymwjUzf21/xIlbajtzgsN7c=
+&#43;google.golang.org/protobuf v1.34.2 h1:6xV6lTsCfpGD21XK49h7MhtcApnLqkfYgPcdHftf6hg=
+&#43;google.golang.org/protobuf v1.34.2/go.mod h1:qYOHts0dSfpeUzUFpOMr/WGzszTmLH&#43;DiWniOlNbLDw=
+&#43;gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+&#43;gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E&#43;C64Yfv1cQ7kz7rIZviUmN&#43;EgEM=
+&#43;gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E&#43;C64Yfv1cQ7kz7rIZviUmN&#43;EgEM=
+&#43;honnef.co/go/tools v0.0.0-20190102054323-c2f93a96b099/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
+&#43;honnef.co/go/tools v0.0.0-20190523083050-ea95bdfd59fc/go.mod h1:rf3lG4BRIbNafJWhAfAdb/ePZxsR/4RtNHQocxwk9r4=
+diff --git a/internal/llm/prompt.go b/internal/llm/prompt.go
+new file mode 100644
+index 0000000..44f13ac
+--- /dev/null
+&#43;&#43;&#43; b/internal/llm/prompt.go
+@@ -0,0 &#43;1,10 @@
+&#43;// Package llm defines provider-neutral language model request contracts.
+&#43;package llm
+&#43;
+&#43;// Prompt is the text contract sent to an LLM provider.
+&#43;type Prompt struct {
+&#43;	// System is the provider-neutral instruction for model behavior.
+&#43;	System string
+&#43;	// User is the provider-neutral review request content.
+&#43;	User string
+&#43;}
+diff --git a/internal/render/html.go b/internal/render/html.go
+new file mode 100644
+index 0000000..c82b817
+--- /dev/null
+&#43;&#43;&#43; b/internal/render/html.go
+@@ -0,0 &#43;1,142 @@
+&#43;// Package render turns review context into output artifacts.
+&#43;package render
+&#43;
+&#43;import (
+&#43;	&#34;bytes&#34;
+&#43;	&#34;context&#34;
+&#43;	&#34;html/template&#34;
+&#43;	&#34;io&#34;
+&#43;	&#34;strings&#34;
+&#43;
+&#43;	&#34;github.com/microcosm-cc/bluemonday&#34;
+&#43;	&#34;github.com/yuin/goldmark&#34;
+&#43;	&#34;github.com/yuin/goldmark/extension&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;const htmlTemplate = `&lt;!doctype html&gt;
+&#43;&lt;html lang=&#34;en&#34;&gt;
+&#43;&lt;head&gt;
+&#43;  &lt;meta charset=&#34;utf-8&#34;&gt;
+&#43;  &lt;meta name=&#34;viewport&#34; content=&#34;width=device-width, initial-scale=1&#34;&gt;
+&#43;  &lt;title&gt;PR Buddy Review Guide&lt;/title&gt;
+&#43;  &lt;style&gt;
+&#43;    body { color: #1f2937; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, &#34;Segoe UI&#34;, sans-serif; line-height: 1.5; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
+&#43;    h1, h2 { color: #111827; line-height: 1.2; }
+&#43;    code, pre { background: #f3f4f6; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+&#43;    code { padding: 0.1rem 0.3rem; }
+&#43;    pre { overflow-x: auto; padding: 1rem; }
+&#43;    pre.mermaid { background: #ffffff; border: 1px solid #e5e7eb; }
+&#43;    table { border-collapse: collapse; width: 100%; }
+&#43;    th, td { border-bottom: 1px solid #e5e7eb; padding: 0.5rem; text-align: left; vertical-align: top; }
+&#43;    .muted { color: #6b7280; }
+&#43;    .review { margin-top: 2rem; }
+&#43;  &lt;/style&gt;
+&#43;&lt;/head&gt;
+&#43;&lt;body&gt;
+&#43;  &lt;main&gt;
+&#43;    &lt;h1&gt;PR Buddy Review Guide&lt;/h1&gt;
+&#43;    &lt;section&gt;
+&#43;      &lt;h2&gt;Repository&lt;/h2&gt;
+&#43;      &lt;p&gt;&lt;strong&gt;{{ .Repository.Name }}&lt;/strong&gt;&lt;/p&gt;
+&#43;      &lt;p class=&#34;muted&#34;&gt;{{ .Repository.Root }}&lt;/p&gt;
+&#43;      {{ if .Repository.RemoteURL }}&lt;p&gt;&lt;code&gt;{{ .Repository.RemoteURL }}&lt;/code&gt;&lt;/p&gt;{{ end }}
+&#43;    &lt;/section&gt;
+&#43;    &lt;section&gt;
+&#43;      &lt;h2&gt;Comparison&lt;/h2&gt;
+&#43;      &lt;p&gt;&lt;code&gt;{{ .Comparison.BaseRef }}&lt;/code&gt; to &lt;code&gt;{{ .Comparison.HeadRef }}&lt;/code&gt;&lt;/p&gt;
+&#43;      &lt;p class=&#34;muted&#34;&gt;Merge base: &lt;code&gt;{{ .Comparison.MergeBase }}&lt;/code&gt;&lt;/p&gt;
+&#43;    &lt;/section&gt;
+&#43;    {{ if .PullRequest }}
+&#43;    &lt;section&gt;
+&#43;      &lt;h2&gt;Pull Request&lt;/h2&gt;
+&#43;      &lt;p&gt;&lt;strong&gt;#{{ .PullRequest.Number }} {{ .PullRequest.Title }}&lt;/strong&gt;&lt;/p&gt;
+&#43;      {{ if .PullRequest.URL }}&lt;p&gt;&lt;code&gt;{{ .PullRequest.URL }}&lt;/code&gt;&lt;/p&gt;{{ end }}
+&#43;      {{ if .PullRequest.Author }}&lt;p class=&#34;muted&#34;&gt;Author: {{ .PullRequest.Author }}&lt;/p&gt;{{ end }}
+&#43;    &lt;/section&gt;
+&#43;    {{ end }}
+&#43;    &lt;section class=&#34;review&#34;&gt;
+&#43;      {{ .ReviewHTML }}
+&#43;    &lt;/section&gt;
+&#43;    &lt;section&gt;
+&#43;      &lt;h2&gt;Raw Context&lt;/h2&gt;
+&#43;      &lt;p class=&#34;muted&#34;&gt;{{ len .Commits }} commits, {{ len .Files }} changed files.&lt;/p&gt;
+&#43;      {{ if .Diff }}&lt;details&gt;&lt;summary&gt;Diff&lt;/summary&gt;&lt;pre&gt;&lt;code&gt;{{ .Diff }}&lt;/code&gt;&lt;/pre&gt;&lt;/details&gt;{{ end }}
+&#43;    &lt;/section&gt;
+&#43;  &lt;/main&gt;
+&#43;  {{ if .HasMermaid }}
+&#43;  &lt;script type=&#34;module&#34;&gt;
+&#43;    import mermaid from &#34;https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs&#34;;
+&#43;    document.querySelectorAll(&#34;pre &gt; code.language-mermaid&#34;).forEach((code) =&gt; {
+&#43;      const container = document.createElement(&#34;pre&#34;);
+&#43;      container.className = &#34;mermaid&#34;;
+&#43;      container.textContent = code.textContent;
+&#43;      code.parentElement.replaceWith(container);
+&#43;    });
+&#43;    mermaid.initialize({ startOnLoad: true });
+&#43;  &lt;/script&gt;
+&#43;  {{ end }}
+&#43;&lt;/body&gt;
+&#43;&lt;/html&gt;
+&#43;`
+&#43;
+&#43;type htmlTemplateData struct {
+&#43;	review.Context
+&#43;	ReviewHTML template.HTML
+&#43;	HasMermaid bool
+&#43;}
+&#43;
+&#43;// HTMLRenderer renders review markdown as a complete HTML document.
+&#43;type HTMLRenderer struct {
+&#43;	template *template.Template
+&#43;	markdown goldmark.Markdown
+&#43;	policy   *bluemonday.Policy
+&#43;}
+&#43;
+&#43;// NewHTMLRenderer creates an HTML renderer.
+&#43;func NewHTMLRenderer() *HTMLRenderer {
+&#43;	return &amp;HTMLRenderer{
+&#43;		template: template.Must(template.New(&#34;review&#34;).Parse(htmlTemplate)),
+&#43;		markdown: goldmark.New(
+&#43;			goldmark.WithExtensions(extension.GFM),
+&#43;		),
+&#43;		policy: markdownPolicy(),
+&#43;	}
+&#43;}
+&#43;
+&#43;// Render writes a complete HTML document to out.
+&#43;func (r *HTMLRenderer) Render(_ context.Context, out io.Writer, ctx review.Context, markdown string) error {
+&#43;	reviewHTML, err := r.renderMarkdown(markdown)
+&#43;	if err != nil {
+&#43;		return err
+&#43;	}
+&#43;
+&#43;	return r.template.Execute(out, htmlTemplateData{
+&#43;		Context:    ctx,
+&#43;		ReviewHTML: reviewHTML,
+&#43;		HasMermaid: hasMermaid(markdown),
+&#43;	})
+&#43;}
+&#43;
+&#43;func (r *HTMLRenderer) renderMarkdown(markdown string) (template.HTML, error) {
+&#43;	var out bytes.Buffer
+&#43;	if err := r.markdown.Convert([]byte(markdown), &amp;out); err != nil {
+&#43;		return &#34;&#34;, err
+&#43;	}
+&#43;
+&#43;	return template.HTML(r.policy.Sanitize(out.String())), nil
+&#43;}
+&#43;
+&#43;func markdownPolicy() *bluemonday.Policy {
+&#43;	policy := bluemonday.UGCPolicy()
+&#43;	policy.AllowAttrs(&#34;class&#34;).Matching(bluemonday.SpaceSeparatedTokens).OnElements(&#34;code&#34;)
+&#43;	policy.AllowElements(&#34;table&#34;, &#34;thead&#34;, &#34;tbody&#34;, &#34;tr&#34;, &#34;th&#34;, &#34;td&#34;)
+&#43;	policy.AllowAttrs(&#34;align&#34;).OnElements(&#34;th&#34;, &#34;td&#34;)
+&#43;
+&#43;	return policy
+&#43;}
+&#43;
+&#43;func hasMermaid(markdown string) bool {
+&#43;	return strings.Contains(markdown, &#34;```mermaid&#34;)
+&#43;}
+diff --git a/internal/render/html_test.go b/internal/render/html_test.go
+new file mode 100644
+index 0000000..1cbfbd0
+--- /dev/null
+&#43;&#43;&#43; b/internal/render/html_test.go
+@@ -0,0 &#43;1,112 @@
+&#43;package render
+&#43;
+&#43;import (
+&#43;	&#34;bytes&#34;
+&#43;	&#34;context&#34;
+&#43;	&#34;strings&#34;
+&#43;	&#34;testing&#34;
+&#43;
+&#43;	&#34;github.com/pangobit/prbuddy/internal/review&#34;
+&#43;)
+&#43;
+&#43;func TestHTMLRendererWritesCompleteDocumentFromMarkdown(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	reviewContext := review.Context{
+&#43;		Repository: review.Repository{
+&#43;			Name:      &#34;prbuddy&#34;,
+&#43;			Root:      &#34;/tmp/prbuddy&#34;,
+&#43;			RemoteURL: &#34;git@github.com:pangobit/prbuddy.git&#34;,
+&#43;		},
+&#43;		Comparison: review.Comparison{
+&#43;			BaseRef:   &#34;main&#34;,
+&#43;			HeadRef:   &#34;feature&#34;,
+&#43;			MergeBase: &#34;1234567890abcdef&#34;,
+&#43;		},
+&#43;		PullRequest: &amp;review.PullRequestMetadata{
+&#43;			Number: 42,
+&#43;			Title:  &#34;Add renderer&#34;,
+&#43;			URL:    &#34;https://github.com/pangobit/prbuddy/pull/42&#34;,
+&#43;			Author: &#34;ray&#34;,
+&#43;		},
+&#43;		Commits: []review.Commit{{Hash: &#34;abcdef1234567890&#34;}},
+&#43;		Files:   []review.ChangedFile{{Path: &#34;internal/render/html.go&#34;}},
+&#43;		Diff:    &#34;diff --git a/a b/a\n&#43;hello&#34;,
+&#43;	}
+&#43;
+&#43;	var out bytes.Buffer
+&#43;	renderer := NewHTMLRenderer()
+&#43;	if err := renderer.Render(context.Background(), &amp;out, reviewContext, &#34;## Review\n\n- Check tests.&#34;); err != nil {
+&#43;		t.Fatalf(&#34;render html: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	got := out.String()
+&#43;	required := []string{
+&#43;		&#34;&lt;!doctype html&gt;&#34;,
+&#43;		&#34;&lt;html lang=\&#34;en\&#34;&gt;&#34;,
+&#43;		&#34;PR Buddy Review Guide&#34;,
+&#43;		&#34;#42 Add renderer&#34;,
+&#43;		&#34;&lt;h2&gt;Review&lt;/h2&gt;&#34;,
+&#43;		&#34;&lt;li&gt;Check tests.&lt;/li&gt;&#34;,
+&#43;		&#34;1 commits, 1 changed files.&#34;,
+&#43;		&#34;&lt;/html&gt;&#34;,
+&#43;	}
+&#43;
+&#43;	for _, want := range required {
+&#43;		if !strings.Contains(got, want) {
+&#43;			t.Fatalf(&#34;rendered html missing %q in:\n%s&#34;, want, got)
+&#43;		}
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestHTMLRendererEscapesRawHTMLInMarkdown(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	var out bytes.Buffer
+&#43;	renderer := NewHTMLRenderer()
+&#43;	err := renderer.Render(context.Background(), &amp;out, review.Context{}, &#34;&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&#34;)
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;render html: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if strings.Contains(out.String(), &#34;&lt;script&gt;&#34;) {
+&#43;		t.Fatalf(&#34;rendered html contains raw script:\n%s&#34;, out.String())
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestHTMLRendererSupportsTablesAndMermaidBlocks(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	markdown := strings.Join([]string{
+&#43;		&#34;| Risk | Impact |&#34;,
+&#43;		&#34;| --- | --- |&#34;,
+&#43;		&#34;| Side effect | High |&#34;,
+&#43;		&#34;&#34;,
+&#43;		&#34;```mermaid&#34;,
+&#43;		&#34;flowchart TD&#34;,
+&#43;		&#34;  A --&gt; B&#34;,
+&#43;		&#34;```&#34;,
+&#43;	}, &#34;\n&#34;)
+&#43;
+&#43;	var out bytes.Buffer
+&#43;	renderer := NewHTMLRenderer()
+&#43;	err := renderer.Render(context.Background(), &amp;out, review.Context{}, markdown)
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;render html: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	got := out.String()
+&#43;	required := []string{
+&#43;		&#34;&lt;table&gt;&#34;,
+&#43;		&#34;&lt;th&gt;Risk&lt;/th&gt;&#34;,
+&#43;		&#34;&lt;td&gt;Side effect&lt;/td&gt;&#34;,
+&#43;		&#34;language-mermaid&#34;,
+&#43;		&#34;mermaid.initialize&#34;,
+&#43;	}
+&#43;
+&#43;	for _, want := range required {
+&#43;		if !strings.Contains(got, want) {
+&#43;			t.Fatalf(&#34;rendered html missing %q in:\n%s&#34;, want, got)
+&#43;		}
+&#43;	}
+&#43;}
+diff --git a/internal/review/context.go b/internal/review/context.go
+new file mode 100644
+index 0000000..88febb2
+--- /dev/null
+&#43;&#43;&#43; b/internal/review/context.go
+@@ -0,0 &#43;1,116 @@
+&#43;// Package review models the repository context needed to guide PR review.
+&#43;package review
+&#43;
+&#43;// CollectOptions describes the local comparison a collector should inspect.
+&#43;type CollectOptions struct {
+&#43;	// RepositoryPath is the filesystem path to the git repository.
+&#43;	RepositoryPath string
+&#43;	// BaseRef is the git ref that represents the target branch.
+&#43;	BaseRef string
+&#43;	// HeadRef is the git ref that represents the proposed changes.
+&#43;	HeadRef string
+&#43;	// EventPath is the optional path to a GitHub Actions event payload.
+&#43;	EventPath string
+&#43;	// CI contains environment metadata from the current workflow run.
+&#43;	CI CIContext
+&#43;}
+&#43;
+&#43;// Context contains the structured material used to render a review guide.
+&#43;type Context struct {
+&#43;	// Repository describes the checked-out repository.
+&#43;	Repository Repository
+&#43;	// Comparison identifies the base and head refs being reviewed.
+&#43;	Comparison Comparison
+&#43;	// Commits lists commits included in the comparison.
+&#43;	Commits []Commit
+&#43;	// Files lists files changed in the comparison.
+&#43;	Files []ChangedFile
+&#43;	// Diff contains the patch for the comparison.
+&#43;	Diff string
+&#43;	// PullRequest contains PR metadata when it is available from an event payload.
+&#43;	PullRequest *PullRequestMetadata
+&#43;	// CI contains CI metadata when PR Buddy runs inside GitHub Actions.
+&#43;	CI CIContext
+&#43;}
+&#43;
+&#43;// Repository describes the git repository under review.
+&#43;type Repository struct {
+&#43;	// Name is the repository name inferred from the git root.
+&#43;	Name string
+&#43;	// Root is the absolute git working tree root.
+&#43;	Root string
+&#43;	// RemoteURL is the origin remote URL when one is configured.
+&#43;	RemoteURL string
+&#43;}
+&#43;
+&#43;// Comparison identifies the refs and merge base used for review.
+&#43;type Comparison struct {
+&#43;	// BaseRef is the requested base git ref.
+&#43;	BaseRef string
+&#43;	// HeadRef is the requested head git ref.
+&#43;	HeadRef string
+&#43;	// MergeBase is the git merge base between BaseRef and HeadRef.
+&#43;	MergeBase string
+&#43;}
+&#43;
+&#43;// Commit describes one commit included in the comparison.
+&#43;type Commit struct {
+&#43;	// Hash is the full git commit hash.
+&#43;	Hash string
+&#43;	// Subject is the first line of the commit message.
+&#43;	Subject string
+&#43;	// Author is the commit author name.
+&#43;	Author string
+&#43;}
+&#43;
+&#43;// ChangedFile describes a file changed in the comparison.
+&#43;type ChangedFile struct {
+&#43;	// Path is the changed file path.
+&#43;	Path string
+&#43;	// Status is the git change status.
+&#43;	Status string
+&#43;	// Additions is the number of added lines when git can report it.
+&#43;	Additions int
+&#43;	// Deletions is the number of deleted lines when git can report it.
+&#43;	Deletions int
+&#43;}
+&#43;
+&#43;// PullRequestMetadata describes a pull request from a local event payload.
+&#43;type PullRequestMetadata struct {
+&#43;	// Number is the pull request number.
+&#43;	Number int
+&#43;	// Title is the pull request title.
+&#43;	Title string
+&#43;	// Body is the pull request description.
+&#43;	Body string
+&#43;	// URL is the browser URL for the pull request.
+&#43;	URL string
+&#43;	// Author is the pull request author login.
+&#43;	Author string
+&#43;	// BaseRef is the target branch name from the event payload.
+&#43;	BaseRef string
+&#43;	// HeadRef is the source branch name from the event payload.
+&#43;	HeadRef string
+&#43;	// BaseSHA is the target branch SHA from the event payload.
+&#43;	BaseSHA string
+&#43;	// HeadSHA is the source branch SHA from the event payload.
+&#43;	HeadSHA string
+&#43;}
+&#43;
+&#43;// CIContext describes metadata available from a CI provider.
+&#43;type CIContext struct {
+&#43;	// GitHubActions is true when running in GitHub Actions.
+&#43;	GitHubActions bool
+&#43;	// Repository is the repository identifier supplied by CI.
+&#43;	Repository string
+&#43;	// SHA is the triggering commit SHA supplied by CI.
+&#43;	SHA string
+&#43;	// EventName is the workflow event name supplied by CI.
+&#43;	EventName string
+&#43;	// ServerURL is the GitHub server URL supplied by CI.
+&#43;	ServerURL string
+&#43;	// BaseRef is the pull request base branch supplied by CI.
+&#43;	BaseRef string
+&#43;	// HeadRef is the pull request head branch supplied by CI.
+&#43;	HeadRef string
+&#43;}
+diff --git a/internal/review/event.go b/internal/review/event.go
+new file mode 100644
+index 0000000..9cb9791
+--- /dev/null
+&#43;&#43;&#43; b/internal/review/event.go
+@@ -0,0 &#43;1,82 @@
+&#43;package review
+&#43;
+&#43;import (
+&#43;	&#34;encoding/json&#34;
+&#43;	&#34;fmt&#34;
+&#43;	&#34;os&#34;
+&#43;)
+&#43;
+&#43;func collectEventMetadata(path string) (*PullRequestMetadata, error) {
+&#43;	if path == &#34;&#34; {
+&#43;		return nil, nil
+&#43;	}
+&#43;
+&#43;	data, err := os.ReadFile(path)
+&#43;	if err != nil {
+&#43;		return nil, fmt.Errorf(&#34;read event payload: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	metadata, err := parseGitHubEvent(data)
+&#43;	if err != nil {
+&#43;		return nil, fmt.Errorf(&#34;parse event payload: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	return metadata, nil
+&#43;}
+&#43;
+&#43;func parseGitHubEvent(data []byte) (*PullRequestMetadata, error) {
+&#43;	var event githubEvent
+&#43;	if err := json.Unmarshal(data, &amp;event); err != nil {
+&#43;		return nil, err
+&#43;	}
+&#43;
+&#43;	if event.PullRequest == nil {
+&#43;		return nil, nil
+&#43;	}
+&#43;
+&#43;	return &amp;PullRequestMetadata{
+&#43;		Number:  firstNonZero(event.PullRequest.Number, event.Number),
+&#43;		Title:   event.PullRequest.Title,
+&#43;		Body:    event.PullRequest.Body,
+&#43;		URL:     event.PullRequest.HTMLURL,
+&#43;		Author:  event.PullRequest.User.Login,
+&#43;		BaseRef: event.PullRequest.Base.Ref,
+&#43;		HeadRef: event.PullRequest.Head.Ref,
+&#43;		BaseSHA: event.PullRequest.Base.SHA,
+&#43;		HeadSHA: event.PullRequest.Head.SHA,
+&#43;	}, nil
+&#43;}
+&#43;
+&#43;type githubEvent struct {
+&#43;	Number      int                `json:&#34;number&#34;`
+&#43;	PullRequest *githubPullRequest `json:&#34;pull_request&#34;`
+&#43;}
+&#43;
+&#43;type githubPullRequest struct {
+&#43;	Number  int           `json:&#34;number&#34;`
+&#43;	Title   string        `json:&#34;title&#34;`
+&#43;	Body    string        `json:&#34;body&#34;`
+&#43;	HTMLURL string        `json:&#34;html_url&#34;`
+&#43;	User    githubUser    `json:&#34;user&#34;`
+&#43;	Base    githubPullRef `json:&#34;base&#34;`
+&#43;	Head    githubPullRef `json:&#34;head&#34;`
+&#43;}
+&#43;
+&#43;type githubUser struct {
+&#43;	Login string `json:&#34;login&#34;`
+&#43;}
+&#43;
+&#43;type githubPullRef struct {
+&#43;	Ref string `json:&#34;ref&#34;`
+&#43;	SHA string `json:&#34;sha&#34;`
+&#43;}
+&#43;
+&#43;func firstNonZero(values ...int) int {
+&#43;	for _, value := range values {
+&#43;		if value != 0 {
+&#43;			return value
+&#43;		}
+&#43;	}
+&#43;
+&#43;	return 0
+&#43;}
+diff --git a/internal/review/event_test.go b/internal/review/event_test.go
+new file mode 100644
+index 0000000..0e26522
+--- /dev/null
+&#43;&#43;&#43; b/internal/review/event_test.go
+@@ -0,0 &#43;1,55 @@
+&#43;package review
+&#43;
+&#43;import &#34;testing&#34;
+&#43;
+&#43;func TestParseGitHubEventReturnsPullRequestMetadata(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	metadata, err := parseGitHubEvent([]byte(`{
+&#43;		&#34;number&#34;: 42,
+&#43;		&#34;pull_request&#34;: {
+&#43;			&#34;title&#34;: &#34;Add LLM review&#34;,
+&#43;			&#34;body&#34;: &#34;Please review this carefully.&#34;,
+&#43;			&#34;html_url&#34;: &#34;https://github.com/pangobit/prbuddy/pull/42&#34;,
+&#43;			&#34;user&#34;: {&#34;login&#34;: &#34;ray&#34;},
+&#43;			&#34;base&#34;: {&#34;ref&#34;: &#34;main&#34;, &#34;sha&#34;: &#34;base-sha&#34;},
+&#43;			&#34;head&#34;: {&#34;ref&#34;: &#34;feature&#34;, &#34;sha&#34;: &#34;head-sha&#34;}
+&#43;		}
+&#43;	}`))
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;parse event: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if metadata == nil {
+&#43;		t.Fatal(&#34;metadata is nil&#34;)
+&#43;	}
+&#43;
+&#43;	if metadata.Number != 42 {
+&#43;		t.Fatalf(&#34;number = %d&#34;, metadata.Number)
+&#43;	}
+&#43;
+&#43;	if metadata.Title != &#34;Add LLM review&#34; {
+&#43;		t.Fatalf(&#34;title = %q&#34;, metadata.Title)
+&#43;	}
+&#43;
+&#43;	if metadata.Author != &#34;ray&#34; {
+&#43;		t.Fatalf(&#34;author = %q&#34;, metadata.Author)
+&#43;	}
+&#43;
+&#43;	if metadata.BaseSHA != &#34;base-sha&#34; {
+&#43;		t.Fatalf(&#34;base sha = %q&#34;, metadata.BaseSHA)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestParseGitHubEventToleratesNonPullRequestPayload(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	metadata, err := parseGitHubEvent([]byte(`{&#34;repository&#34;:{&#34;full_name&#34;:&#34;pangobit/prbuddy&#34;}}`))
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;parse event: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if metadata != nil {
+&#43;		t.Fatalf(&#34;metadata = %#v&#34;, metadata)
+&#43;	}
+&#43;}
+diff --git a/internal/review/git.go b/internal/review/git.go
+new file mode 100644
+index 0000000..c591972
+--- /dev/null
+&#43;&#43;&#43; b/internal/review/git.go
+@@ -0,0 &#43;1,251 @@
+&#43;package review
+&#43;
+&#43;import (
+&#43;	&#34;bytes&#34;
+&#43;	&#34;context&#34;
+&#43;	&#34;fmt&#34;
+&#43;	&#34;os/exec&#34;
+&#43;	&#34;path/filepath&#34;
+&#43;	&#34;strconv&#34;
+&#43;	&#34;strings&#34;
+&#43;)
+&#43;
+&#43;// GitCollector collects review context from a local git checkout.
+&#43;type GitCollector struct {
+&#43;	repositoryPath string
+&#43;}
+&#43;
+&#43;// NewGitCollector creates a collector rooted at repositoryPath.
+&#43;func NewGitCollector(repositoryPath string) *GitCollector {
+&#43;	return &amp;GitCollector{repositoryPath: repositoryPath}
+&#43;}
+&#43;
+&#43;// Collect builds a review context by comparing the requested git refs.
+&#43;func (c *GitCollector) Collect(ctx context.Context, opts CollectOptions) (Context, error) {
+&#43;	repositoryPath := c.repositoryPath
+&#43;	if opts.RepositoryPath != &#34;&#34; {
+&#43;		repositoryPath = opts.RepositoryPath
+&#43;	}
+&#43;
+&#43;	root, err := gitOutput(ctx, repositoryPath, &#34;rev-parse&#34;, &#34;--show-toplevel&#34;)
+&#43;	if err != nil {
+&#43;		return Context{}, fmt.Errorf(&#34;find git root: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	mergeBase, err := gitOutput(ctx, root, &#34;merge-base&#34;, opts.BaseRef, opts.HeadRef)
+&#43;	if err != nil {
+&#43;		return Context{}, fmt.Errorf(&#34;find merge base for %q and %q: %w&#34;, opts.BaseRef, opts.HeadRef, err)
+&#43;	}
+&#43;
+&#43;	remoteURL, err := gitOutput(ctx, root, &#34;remote&#34;, &#34;get-url&#34;, &#34;origin&#34;)
+&#43;	if err != nil {
+&#43;		remoteURL = &#34;&#34;
+&#43;	}
+&#43;
+&#43;	commits, err := collectCommits(ctx, root, mergeBase, opts.HeadRef)
+&#43;	if err != nil {
+&#43;		return Context{}, err
+&#43;	}
+&#43;
+&#43;	files, err := collectFiles(ctx, root, opts.BaseRef, opts.HeadRef)
+&#43;	if err != nil {
+&#43;		return Context{}, err
+&#43;	}
+&#43;
+&#43;	diff, err := gitRawOutput(ctx, root, &#34;diff&#34;, &#34;--find-renames&#34;, &#34;--patch&#34;, opts.BaseRef&#43;&#34;...&#34;&#43;opts.HeadRef)
+&#43;	if err != nil {
+&#43;		return Context{}, fmt.Errorf(&#34;collect diff: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	pullRequest, err := collectEventMetadata(opts.EventPath)
+&#43;	if err != nil {
+&#43;		return Context{}, err
+&#43;	}
+&#43;
+&#43;	return Context{
+&#43;		Repository: Repository{
+&#43;			Name:      filepath.Base(root),
+&#43;			Root:      root,
+&#43;			RemoteURL: remoteURL,
+&#43;		},
+&#43;		Comparison: Comparison{
+&#43;			BaseRef:   opts.BaseRef,
+&#43;			HeadRef:   opts.HeadRef,
+&#43;			MergeBase: mergeBase,
+&#43;		},
+&#43;		Commits:     commits,
+&#43;		Files:       files,
+&#43;		Diff:        diff,
+&#43;		PullRequest: pullRequest,
+&#43;		CI:          opts.CI,
+&#43;	}, nil
+&#43;}
+&#43;
+&#43;func collectCommits(ctx context.Context, root string, mergeBase string, headRef string) ([]Commit, error) {
+&#43;	output, err := gitRawOutput(ctx, root, &#34;log&#34;, &#34;--format=%H%x00%s%x00%an&#34;, mergeBase&#43;&#34;..&#34;&#43;headRef)
+&#43;	if err != nil {
+&#43;		return nil, fmt.Errorf(&#34;collect commits: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	output = strings.TrimSpace(output)
+&#43;	if output == &#34;&#34; {
+&#43;		return nil, nil
+&#43;	}
+&#43;
+&#43;	lines := strings.Split(output, &#34;\n&#34;)
+&#43;	commits := make([]Commit, 0, len(lines))
+&#43;	for _, line := range lines {
+&#43;		fields := strings.Split(line, &#34;\x00&#34;)
+&#43;		if len(fields) != 3 {
+&#43;			return nil, fmt.Errorf(&#34;parse commit line %q&#34;, line)
+&#43;		}
+&#43;
+&#43;		commits = append(commits, Commit{
+&#43;			Hash:    fields[0],
+&#43;			Subject: fields[1],
+&#43;			Author:  fields[2],
+&#43;		})
+&#43;	}
+&#43;
+&#43;	return commits, nil
+&#43;}
+&#43;
+&#43;func collectFiles(ctx context.Context, root string, baseRef string, headRef string) ([]ChangedFile, error) {
+&#43;	spec := baseRef &#43; &#34;...&#34; &#43; headRef
+&#43;
+&#43;	statusOutput, err := gitRawOutput(ctx, root, &#34;diff&#34;, &#34;--find-renames&#34;, &#34;--name-status&#34;, spec)
+&#43;	if err != nil {
+&#43;		return nil, fmt.Errorf(&#34;collect file status: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	files, err := parseNameStatus(statusOutput)
+&#43;	if err != nil {
+&#43;		return nil, err
+&#43;	}
+&#43;
+&#43;	numstatOutput, err := gitRawOutput(ctx, root, &#34;diff&#34;, &#34;--find-renames&#34;, &#34;--numstat&#34;, spec)
+&#43;	if err != nil {
+&#43;		return nil, fmt.Errorf(&#34;collect file stats: %w&#34;, err)
+&#43;	}
+&#43;
+&#43;	stats, err := parseNumstat(numstatOutput)
+&#43;	if err != nil {
+&#43;		return nil, err
+&#43;	}
+&#43;
+&#43;	for i := range files {
+&#43;		stat, ok := stats[files[i].Path]
+&#43;		if !ok {
+&#43;			continue
+&#43;		}
+&#43;
+&#43;		files[i].Additions = stat.additions
+&#43;		files[i].Deletions = stat.deletions
+&#43;	}
+&#43;
+&#43;	return files, nil
+&#43;}
+&#43;
+&#43;func parseNameStatus(output string) ([]ChangedFile, error) {
+&#43;	output = strings.TrimSpace(output)
+&#43;	if output == &#34;&#34; {
+&#43;		return nil, nil
+&#43;	}
+&#43;
+&#43;	lines := strings.Split(output, &#34;\n&#34;)
+&#43;	files := make([]ChangedFile, 0, len(lines))
+&#43;	for _, line := range lines {
+&#43;		fields := strings.Split(line, &#34;\t&#34;)
+&#43;		if len(fields) &lt; 2 {
+&#43;			return nil, fmt.Errorf(&#34;parse name status line %q&#34;, line)
+&#43;		}
+&#43;
+&#43;		status := fields[0]
+&#43;		path := fields[len(fields)-1]
+&#43;		files = append(files, ChangedFile{
+&#43;			Path:   path,
+&#43;			Status: status,
+&#43;		})
+&#43;	}
+&#43;
+&#43;	return files, nil
+&#43;}
+&#43;
+&#43;type fileStat struct {
+&#43;	additions int
+&#43;	deletions int
+&#43;}
+&#43;
+&#43;func parseNumstat(output string) (map[string]fileStat, error) {
+&#43;	stats := make(map[string]fileStat)
+&#43;	output = strings.TrimSpace(output)
+&#43;	if output == &#34;&#34; {
+&#43;		return stats, nil
+&#43;	}
+&#43;
+&#43;	for _, line := range strings.Split(output, &#34;\n&#34;) {
+&#43;		fields := strings.Split(line, &#34;\t&#34;)
+&#43;		if len(fields) &lt; 3 {
+&#43;			return nil, fmt.Errorf(&#34;parse numstat line %q&#34;, line)
+&#43;		}
+&#43;
+&#43;		additions, err := parseGitLineCount(fields[0])
+&#43;		if err != nil {
+&#43;			return nil, fmt.Errorf(&#34;parse additions for %q: %w&#34;, line, err)
+&#43;		}
+&#43;
+&#43;		deletions, err := parseGitLineCount(fields[1])
+&#43;		if err != nil {
+&#43;			return nil, fmt.Errorf(&#34;parse deletions for %q: %w&#34;, line, err)
+&#43;		}
+&#43;
+&#43;		stats[fields[len(fields)-1]] = fileStat{
+&#43;			additions: additions,
+&#43;			deletions: deletions,
+&#43;		}
+&#43;	}
+&#43;
+&#43;	return stats, nil
+&#43;}
+&#43;
+&#43;func parseGitLineCount(value string) (int, error) {
+&#43;	if value == &#34;-&#34; {
+&#43;		return 0, nil
+&#43;	}
+&#43;
+&#43;	lineCount, err := strconv.Atoi(value)
+&#43;	if err != nil {
+&#43;		return 0, err
+&#43;	}
+&#43;
+&#43;	return lineCount, nil
+&#43;}
+&#43;
+&#43;func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+&#43;	output, err := gitRawOutput(ctx, dir, args...)
+&#43;	if err != nil {
+&#43;		return &#34;&#34;, err
+&#43;	}
+&#43;
+&#43;	return strings.TrimSpace(output), nil
+&#43;}
+&#43;
+&#43;func gitRawOutput(ctx context.Context, dir string, args ...string) (string, error) {
+&#43;	cmd := exec.CommandContext(ctx, &#34;git&#34;, args...)
+&#43;	cmd.Dir = dir
+&#43;
+&#43;	var stderr bytes.Buffer
+&#43;	cmd.Stderr = &amp;stderr
+&#43;
+&#43;	output, err := cmd.Output()
+&#43;	if err != nil {
+&#43;		message := strings.TrimSpace(stderr.String())
+&#43;		if message == &#34;&#34; {
+&#43;			return &#34;&#34;, err
+&#43;		}
+&#43;
+&#43;		return &#34;&#34;, fmt.Errorf(&#34;%w: %s&#34;, err, message)
+&#43;	}
+&#43;
+&#43;	return string(output), nil
+&#43;}
+diff --git a/internal/review/git_test.go b/internal/review/git_test.go
+new file mode 100644
+index 0000000..31e2d4d
+--- /dev/null
+&#43;&#43;&#43; b/internal/review/git_test.go
+@@ -0,0 &#43;1,115 @@
+&#43;package review
+&#43;
+&#43;import (
+&#43;	&#34;context&#34;
+&#43;	&#34;os&#34;
+&#43;	&#34;os/exec&#34;
+&#43;	&#34;path/filepath&#34;
+&#43;	&#34;strings&#34;
+&#43;	&#34;testing&#34;
+&#43;)
+&#43;
+&#43;func TestGitCollectorCollectsReviewContext(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	dir := t.TempDir()
+&#43;	runGitTest(t, dir, &#34;init&#34;)
+&#43;	runGitTest(t, dir, &#34;config&#34;, &#34;user.name&#34;, &#34;PR Buddy&#34;)
+&#43;	runGitTest(t, dir, &#34;config&#34;, &#34;user.email&#34;, &#34;prbuddy@example.com&#34;)
+&#43;	runGitTest(t, dir, &#34;checkout&#34;, &#34;-b&#34;, &#34;main&#34;)
+&#43;	writeTestFile(t, filepath.Join(dir, &#34;README.md&#34;), &#34;hello\n&#34;)
+&#43;	runGitTest(t, dir, &#34;add&#34;, &#34;README.md&#34;)
+&#43;	runGitTest(t, dir, &#34;commit&#34;, &#34;-m&#34;, &#34;Initial commit&#34;)
+&#43;	runGitTest(t, dir, &#34;checkout&#34;, &#34;-b&#34;, &#34;feature&#34;)
+&#43;	writeTestFile(t, filepath.Join(dir, &#34;README.md&#34;), &#34;hello\nworld\n&#34;)
+&#43;	runGitTest(t, dir, &#34;add&#34;, &#34;README.md&#34;)
+&#43;	runGitTest(t, dir, &#34;commit&#34;, &#34;-m&#34;, &#34;Expand readme&#34;)
+&#43;
+&#43;	collector := NewGitCollector(dir)
+&#43;	ctx, err := collector.Collect(context.Background(), CollectOptions{
+&#43;		RepositoryPath: dir,
+&#43;		BaseRef:        &#34;main&#34;,
+&#43;		HeadRef:        &#34;feature&#34;,
+&#43;	})
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;collect review context: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if ctx.Repository.Name != filepath.Base(dir) {
+&#43;		t.Fatalf(&#34;repository name = %q&#34;, ctx.Repository.Name)
+&#43;	}
+&#43;
+&#43;	if ctx.Comparison.BaseRef != &#34;main&#34; {
+&#43;		t.Fatalf(&#34;base ref = %q&#34;, ctx.Comparison.BaseRef)
+&#43;	}
+&#43;
+&#43;	if len(ctx.Commits) != 1 {
+&#43;		t.Fatalf(&#34;commit count = %d&#34;, len(ctx.Commits))
+&#43;	}
+&#43;
+&#43;	if ctx.Commits[0].Subject != &#34;Expand readme&#34; {
+&#43;		t.Fatalf(&#34;commit subject = %q&#34;, ctx.Commits[0].Subject)
+&#43;	}
+&#43;
+&#43;	if len(ctx.Files) != 1 {
+&#43;		t.Fatalf(&#34;file count = %d&#34;, len(ctx.Files))
+&#43;	}
+&#43;
+&#43;	if ctx.Files[0].Path != &#34;README.md&#34; {
+&#43;		t.Fatalf(&#34;file path = %q&#34;, ctx.Files[0].Path)
+&#43;	}
+&#43;
+&#43;	if ctx.Files[0].Additions != 1 {
+&#43;		t.Fatalf(&#34;additions = %d&#34;, ctx.Files[0].Additions)
+&#43;	}
+&#43;
+&#43;	if !strings.Contains(ctx.Diff, &#34;&#43;world&#34;) {
+&#43;		t.Fatalf(&#34;diff = %q&#34;, ctx.Diff)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestParseNameStatusRejectsMalformedLine(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	_, err := parseNameStatus(&#34;M&#34;)
+&#43;	if err == nil {
+&#43;		t.Fatal(&#34;expected error&#34;)
+&#43;	}
+&#43;}
+&#43;
+&#43;func TestParseNumstatHandlesBinaryFiles(t *testing.T) {
+&#43;	t.Parallel()
+&#43;
+&#43;	stats, err := parseNumstat(&#34;-\t-\timage.png&#34;)
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;parse numstat: %v&#34;, err)
+&#43;	}
+&#43;
+&#43;	if stats[&#34;image.png&#34;].additions != 0 {
+&#43;		t.Fatalf(&#34;additions = %d&#34;, stats[&#34;image.png&#34;].additions)
+&#43;	}
+&#43;
+&#43;	if stats[&#34;image.png&#34;].deletions != 0 {
+&#43;		t.Fatalf(&#34;deletions = %d&#34;, stats[&#34;image.png&#34;].deletions)
+&#43;	}
+&#43;}
+&#43;
+&#43;func runGitTest(t *testing.T, dir string, args ...string) {
+&#43;	t.Helper()
+&#43;
+&#43;	cmd := exec.Command(&#34;git&#34;, args...)
+&#43;	cmd.Dir = dir
+&#43;
+&#43;	output, err := cmd.CombinedOutput()
+&#43;	if err != nil {
+&#43;		t.Fatalf(&#34;git %v: %v\n%s&#34;, args, err, string(output))
+&#43;	}
+&#43;}
+&#43;
+&#43;func writeTestFile(t *testing.T, path string, content string) {
+&#43;	t.Helper()
+&#43;
+&#43;	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+&#43;		t.Fatalf(&#34;write %s: %v&#34;, path, err)
+&#43;	}
+&#43;}
+</code></pre></details>
+    </section>
+  </main>
+  
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    document.querySelectorAll("pre > code.language-mermaid").forEach((code) => {
+      const container = document.createElement("div");
+      container.className = "mermaid";
+      container.textContent = code.textContent;
+      code.parentElement.replaceWith(container);
+    });
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+    await mermaid.run({ querySelector: ".mermaid" });
+  </script>
+  
+</body>
+</html>
